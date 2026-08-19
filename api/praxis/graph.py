@@ -16,7 +16,11 @@ persona demands anyway.
 
 Phase order:
 
-    scope -> research -> distill -> gap_check -> research (again) or write -> done
+    scope -> brainstorm -> plan -> research -> distill -> revise_plan
+          -> gap_check -> research (again) or write_section -> done
+
+Writing is one plan section per node, so a killed invocation keeps every
+finished chapter and the listener sees blocks as they land.
 
 gap_check is the loop's conscience. It can send the graph back for another round,
 and it is not permitted to declare readiness before the minimum number of rounds
@@ -37,37 +41,49 @@ except ImportError:  # pragma: no cover
 
 from .keys import SecretVault
 from .llm import LlmProfile, chat_completion, chat_json, run_tool_loop
+from .plan import (
+    apply_plan_patches,
+    mark_written,
+    next_unwritten,
+    plan_from_model,
+    plan_from_subtopics,
+    written_count,
+)
 from .prompts import (
+    brainstorm_prompt,
     distill_prompt,
     gap_check_prompt,
     inline_question_prompt,
     lesson_research_system_prompt,
-    lesson_writing_prompt,
     outline_prompt,
+    plan_prompt,
     research_round_prompt,
+    revise_plan_prompt,
     scoping_prompt,
+    section_writing_prompt,
 )
+from .transport import ProviderHttpError
 
 # How long each node needs, worst case, to be worth starting. These are wall
 # clock seconds and they are deliberately generous: suspending early is free,
 # whereas being killed mid-node loses the whole node's work and its spend.
 NODE_TIME_REQUIREMENTS = {
     "scope": 45,
+    "brainstorm": 35,
+    "plan": 40,
     "research": 100,
     "distill": 45,
+    "revise_plan": 30,
     "gap_check": 35,
-    # Writing an episode is the longest single model turn in the graph — it emits
-    # thousands of tokens in one call. A measured run started it with time that
-    # looked sufficient and still crossed 300s of wall clock and got killed. The
-    # requirement is therefore set close to a whole pass, so that in practice
-    # writing suspends and claims a fresh invocation to itself rather than
-    # squeezing into whatever is left over after research.
-    "write": 170,
+    # One section, not the whole episode. A measured whole-episode write started
+    # with time that looked sufficient and still crossed 300s. Per-section writes
+    # fit in a fresh invocation and stream to the browser as they finish.
+    "write_section": 90,
 }
 
 DEFAULT_MINIMUM_ROUNDS = 2
 DEFAULT_MAXIMUM_ROUNDS = 5
-DEFAULT_TARGET_BLOCK_COUNT = 12
+DEFAULT_TARGET_BLOCK_COUNT = 8
 
 
 class ResearchDeadline:
@@ -135,6 +151,9 @@ class ResearchState(TypedDict, total=False):
     gap_reasoning: str
     weakest_link: str
 
+    brainstorm: Dict[str, Any]
+    plan: List[Dict[str, str]]
+
     blocks: List[Dict[str, Any]]
     target_block_count: int
 
@@ -176,6 +195,8 @@ def new_research_state(
         "remaining_questions": [],
         "gap_reasoning": "",
         "weakest_link": "",
+        "brainstorm": {},
+        "plan": [],
         "blocks": [],
         "target_block_count": int(target_block_count),
         "searches_performed": 0,
@@ -249,6 +270,42 @@ def _subtopics_text(state: ResearchState) -> str:
     )
 
 
+def _json_timeout(deadline: ResearchDeadline) -> float:
+    """Bound a JSON call so it fails into a suspend instead of killing the slice."""
+    return max(25.0, min(90.0, deadline.remaining() - 20.0))
+
+
+def _plan_digest(plan: List[Dict[str, str]]) -> str:
+    if not plan:
+        return "(no plan yet)"
+    lines = []
+    for item in plan:
+        lines.append(
+            "- {0} [{1}] {2}{3}".format(
+                item.get("id") or "?",
+                item.get("status") or "pending",
+                item.get("title") or "",
+                " — {0}".format(item["angle"]) if item.get("angle") else "",
+            )
+        )
+    return "\n".join(lines)
+
+
+def _brainstorm_digest(brainstorm: Dict[str, Any]) -> str:
+    if not brainstorm:
+        return "(none)"
+    parts = []
+    for key in ("tensions", "must_hunt", "thin_episode", "surprises"):
+        values = brainstorm.get(key) or []
+        if values:
+            parts.append(
+                "{0}: {1}".format(
+                    key, "; ".join(str(item) for item in values[:10])
+                )
+            )
+    return "\n".join(parts) or "(none)"
+
+
 def _scope_digest(state: ResearchState) -> str:
     layers = state.get("layers") or {}
     return (
@@ -318,6 +375,7 @@ def scope_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
         temperature=0.5,
         required_keys=["open_questions", "governing_axis"],
         required_non_empty=["open_questions"],
+        timeout_seconds=_json_timeout(deadline),
     )
 
     open_questions = [
@@ -347,6 +405,126 @@ def scope_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
             str(item) for item in (scoping_result.get("expected_disagreements") or [])
         ],
         "remaining_questions": open_questions,
+        "phase": "brainstorm",
+        "suspended": False,
+    }
+
+
+def brainstorm_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
+    vault, deadline, profile = _runtime(config)
+    if not deadline.may_start_node(NODE_TIME_REQUIREMENTS["brainstorm"]):
+        return _suspend("brainstorm", "not enough time to brainstorm")
+
+    _emit(
+        {
+            "type": "phase",
+            "phase": "brainstorm",
+            "message": "Pressure-testing the episode before planning it",
+        }
+    )
+    try:
+        result = chat_json(
+            vault,
+            messages=[
+                {"role": "system", "content": lesson_research_system_prompt()},
+                {
+                    "role": "user",
+                    "content": brainstorm_prompt(
+                        state["topic"],
+                        _scope_digest(state),
+                        _subtopics_text(state),
+                    ),
+                },
+            ],
+            profile=profile,
+            max_tokens=2500,
+            temperature=0.7,
+            required_keys=["tensions", "must_hunt"],
+            required_non_empty=["tensions"],
+            timeout_seconds=_json_timeout(deadline),
+        )
+    except (ValueError, ProviderHttpError) as failure:
+        _emit({"type": "note", "message": "brainstorm failed: {0}".format(failure)})
+        return _suspend("brainstorm", "brainstorm failed: {0}".format(failure))
+
+    brainstorm = {
+        "tensions": [str(item) for item in (result.get("tensions") or []) if str(item).strip()],
+        "must_hunt": [
+            str(item) for item in (result.get("must_hunt") or []) if str(item).strip()
+        ],
+        "thin_episode": [
+            str(item) for item in (result.get("thin_episode") or []) if str(item).strip()
+        ],
+        "surprises": [
+            str(item) for item in (result.get("surprises") or []) if str(item).strip()
+        ],
+    }
+    _emit(
+        {
+            "type": "brainstorm",
+            "tensions": brainstorm["tensions"][:4],
+            "must_hunt": brainstorm["must_hunt"][:4],
+        }
+    )
+    return {"brainstorm": brainstorm, "phase": "plan", "suspended": False}
+
+
+def plan_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
+    vault, deadline, profile = _runtime(config)
+    if not deadline.may_start_node(NODE_TIME_REQUIREMENTS["plan"]):
+        return _suspend("plan", "not enough time to write the plan")
+
+    existing_subtopics = state.get("subtopics") or []
+    _emit({"type": "phase", "phase": "plan", "message": "Writing the episode plan"})
+
+    if existing_subtopics:
+        seeded = plan_from_subtopics(existing_subtopics)
+    else:
+        seeded = []
+
+    try:
+        result = chat_json(
+            vault,
+            messages=[
+                {"role": "system", "content": lesson_research_system_prompt()},
+                {
+                    "role": "user",
+                    "content": plan_prompt(
+                        state["topic"],
+                        _scope_digest(state),
+                        _brainstorm_digest(state.get("brainstorm") or {}),
+                        _subtopics_text(state),
+                        section_count=max(6, len(seeded) or 6),
+                    ),
+                },
+            ],
+            profile=profile,
+            max_tokens=2500,
+            temperature=0.5,
+            required_keys=["plan"],
+            required_non_empty=["plan"],
+            timeout_seconds=_json_timeout(deadline),
+        )
+        drafted = plan_from_model(result.get("plan") or [])
+    except (ValueError, ProviderHttpError) as failure:
+        _emit({"type": "note", "message": "plan failed: {0}".format(failure)})
+        drafted = []
+
+    plan = drafted or seeded
+    if not plan:
+        plan = plan_from_model(
+            [{"title": state["topic"], "angle": "Cover the question in full."}]
+        )
+
+    _emit(
+        {
+            "type": "plan",
+            "plan": plan,
+            "count": len(plan),
+        }
+    )
+    return {
+        "plan": plan,
         "phase": "research",
         "suspended": False,
     }
@@ -466,6 +644,7 @@ def research_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any
                 tools_enabled=False,
                 max_tokens=2200,
                 temperature=0.4,
+                timeout_seconds=max(25.0, deadline.remaining() - 15.0),
             )
             wrap_up_choices = wrap_up.get("choices") or []
             if wrap_up_choices:
@@ -500,17 +679,25 @@ def distill_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]
         return {"phase": "gap_check", "briefing": "", "suspended": False}
 
     _emit({"type": "phase", "phase": "distill", "message": "Marking claim status"})
-    distilled = chat_json(
-        vault,
-        messages=[
-            {"role": "system", "content": lesson_research_system_prompt()},
-            {"role": "user", "content": distill_prompt(briefing_text)},
-        ],
-        profile=profile,
-        max_tokens=4000,
-        temperature=0.3,
-        required_keys=["findings"],
-    )
+    try:
+        distilled = chat_json(
+            vault,
+            messages=[
+                {"role": "system", "content": lesson_research_system_prompt()},
+                {"role": "user", "content": distill_prompt(briefing_text)},
+            ],
+            profile=profile,
+            max_tokens=3000,
+            temperature=0.3,
+            required_keys=["findings"],
+            timeout_seconds=_json_timeout(deadline),
+        )
+    except (ValueError, ProviderHttpError) as failure:
+        # Keep the briefing in state and suspend so the next slice can retry.
+        # Dropping the briefing here is how a real research round turns into
+        # an episode that opens "we could not retrieve the records".
+        _emit({"type": "note", "message": "distill failed: {0}".format(failure)})
+        return _suspend("distill", "distill failed: {0}".format(failure))
 
     merged_findings = _merge_findings(
         state.get("findings") or [], distilled.get("findings") or []
@@ -537,7 +724,7 @@ def distill_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]
     return {
         "findings": merged_findings,
         "briefing": "",
-        "phase": "gap_check",
+        "phase": "revise_plan",
         "suspended": False,
     }
 
@@ -552,27 +739,32 @@ def gap_check_node(state: ResearchState, config: RunnableConfig) -> Dict[str, An
     maximum_rounds = int(state.get("maximum_rounds") or DEFAULT_MAXIMUM_ROUNDS)
 
     _emit({"type": "phase", "phase": "gap_check", "message": "Auditing what is missing"})
-    audit = chat_json(
-        vault,
-        messages=[
-            {"role": "system", "content": lesson_research_system_prompt()},
-            {
-                "role": "user",
-                "content": gap_check_prompt(
-                    topic=state["topic"],
-                    findings_digest=_findings_digest(state.get("findings") or []),
-                    open_questions_text=_bullet_list(
-                        [str(q) for q in (state.get("open_questions") or [])]
+    try:
+        audit = chat_json(
+            vault,
+            messages=[
+                {"role": "system", "content": lesson_research_system_prompt()},
+                {
+                    "role": "user",
+                    "content": gap_check_prompt(
+                        topic=state["topic"],
+                        findings_digest=_findings_digest(state.get("findings") or []),
+                        open_questions_text=_bullet_list(
+                            [str(q) for q in (state.get("open_questions") or [])]
+                        ),
+                        rounds_completed=rounds_completed,
                     ),
-                    rounds_completed=rounds_completed,
-                ),
-            },
-        ],
-        profile=profile,
-        max_tokens=1800,
-        temperature=0.3,
-        required_keys=["ready"],
-    )
+                },
+            ],
+            profile=profile,
+            max_tokens=1800,
+            temperature=0.3,
+            required_keys=["ready"],
+            timeout_seconds=_json_timeout(deadline),
+        )
+    except (ValueError, ProviderHttpError) as failure:
+        _emit({"type": "note", "message": "gap check failed: {0}".format(failure)})
+        return _suspend("gap_check", "gap check failed: {0}".format(failure))
 
     model_says_ready = bool(audit.get("ready"))
     remaining_questions = [
@@ -596,7 +788,7 @@ def gap_check_node(state: ResearchState, config: RunnableConfig) -> Dict[str, An
     hit_round_ceiling = rounds_completed >= maximum_rounds
 
     if is_ready or hit_round_ceiling:
-        next_phase = "write"
+        next_phase = "write_section"
     else:
         next_phase = "research"
 
@@ -630,74 +822,184 @@ def gap_check_node(state: ResearchState, config: RunnableConfig) -> Dict[str, An
     }
 
 
-def write_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
+def revise_plan_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
     vault, deadline, profile = _runtime(config)
-    if not deadline.may_start_node(NODE_TIME_REQUIREMENTS["write"]):
-        return _suspend("write", "not enough time to write the lesson")
+    if not deadline.may_start_node(NODE_TIME_REQUIREMENTS["revise_plan"]):
+        return _suspend("revise_plan", "not enough time to revise the plan")
 
-    _emit({"type": "phase", "phase": "write", "message": "Writing the episode"})
+    plan = [dict(item) for item in (state.get("plan") or [])]
+    if not plan:
+        return {"phase": "gap_check", "suspended": False}
+
+    _emit({"type": "phase", "phase": "revise_plan", "message": "Editing the plan against the findings"})
+    try:
+        result = chat_json(
+            vault,
+            messages=[
+                {"role": "system", "content": lesson_research_system_prompt()},
+                {
+                    "role": "user",
+                    "content": revise_plan_prompt(
+                        topic=state["topic"],
+                        plan_digest=_plan_digest(plan),
+                        findings_digest=_findings_digest(state.get("findings") or []),
+                        gap_reasoning=state.get("gap_reasoning") or "",
+                    ),
+                },
+            ],
+            profile=profile,
+            max_tokens=1800,
+            temperature=0.3,
+            required_keys=["patches"],
+            timeout_seconds=_json_timeout(deadline),
+        )
+        patches = result.get("patches") or []
+    except (ValueError, ProviderHttpError) as failure:
+        _emit({"type": "note", "message": "plan revise skipped: {0}".format(failure)})
+        patches = []
+
+    if patches:
+        plan = apply_plan_patches(plan, patches)
+        _emit({"type": "plan", "plan": plan, "count": len(plan)})
+
+    return {"plan": plan, "phase": "gap_check", "suspended": False}
+
+
+def write_section_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
+    vault, deadline, profile = _runtime(config)
+    if not deadline.may_start_node(NODE_TIME_REQUIREMENTS["write_section"]):
+        return _suspend("write_section", "not enough time to write the next section")
+
+    plan = [dict(item) for item in (state.get("plan") or [])]
+    if not plan:
+        plan = plan_from_model(
+            [{"title": state["topic"], "angle": "Cover the question in full."}]
+        )
+
+    section = next_unwritten(plan)
+    if section is None:
+        return {"plan": plan, "phase": "done", "suspended": False}
+
+    section_index = next(
+        (index for index, item in enumerate(plan, 1) if item.get("id") == section.get("id")),
+        1,
+    )
+    previous_titles = "\n".join(
+        "- {0}".format(item.get("title") or "")
+        for item in plan
+        if item.get("status") == "written"
+    )
+
+    _emit(
+        {
+            "type": "phase",
+            "phase": "write_section",
+            "message": "Writing: {0}".format(section.get("title") or "section"),
+            "section_id": section.get("id"),
+            "section_index": section_index,
+            "section_count": len(plan),
+        }
+    )
 
     findings = state.get("findings") or []
     evidenced_count = sum(
         1 for finding in findings if finding.get("status") in ("verified", "contested")
     )
+    target_block_count = int(
+        state.get("target_block_count") or DEFAULT_TARGET_BLOCK_COUNT
+    )
 
-    writing_instruction = lesson_writing_prompt(
+    writing_instruction = section_writing_prompt(
         topic=state["topic"],
+        section_title=section.get("title") or "",
+        section_angle=section.get("angle") or "",
+        section_index=section_index,
+        section_count=len(plan),
         scope_digest=_scope_digest(state),
         findings_digest=_findings_digest(findings, limit=60),
-        target_block_count=int(
-            state.get("target_block_count") or DEFAULT_TARGET_BLOCK_COUNT
-        ),
-        subtopics_text=_subtopics_text(state),
+        previous_titles=previous_titles,
+        target_block_count=target_block_count,
     )
 
     if evidenced_count == 0:
-        # The round ceiling can route here with nothing established — a failed run,
-        # a provider outage, every search coming back empty. Left alone the model
-        # writes a confident episode from memory and marks it "verified", because
-        # no finding contradicts it. That is the one error the listener cannot
-        # catch, so the instruction is made explicit rather than hoped for.
         writing_instruction += (
             "\n\nCRITICAL: the research phase established nothing this session. There "
             "are no verified findings and no sources. So: no block may carry status "
             '"verified" or "contested", and no block may cite a source you did not '
             "retrieve. Open by saying plainly that the research did not complete and "
             "what remains unestablished, then give only what you can honestly mark "
-            '"unverified" or "inferred". A short, honest episode is the correct output '
-            "here. Do not manufacture a complete one."
+            '"unverified" or "inferred". Still write the section — inferred argument '
+            "is allowed when labeled — but do not manufacture sources."
         )
         _emit(
             {
                 "type": "note",
-                "message": "writing with no established evidence — episode will be marked unverified",
+                "message": "writing with no established evidence — section will be marked unverified",
             }
         )
 
-    written = chat_json(
-        vault,
-        messages=[
-            {"role": "system", "content": lesson_research_system_prompt()},
-            {"role": "user", "content": writing_instruction},
-        ],
-        profile=profile,
-        max_tokens=9000,
-        temperature=0.75,
-        required_keys=["blocks"],
-        required_non_empty=["blocks"],
+    try:
+        written = chat_json(
+            vault,
+            messages=[
+                {"role": "system", "content": lesson_research_system_prompt()},
+                {"role": "user", "content": writing_instruction},
+            ],
+            profile=profile,
+            max_tokens=4500,
+            temperature=0.75,
+            required_keys=["blocks"],
+            required_non_empty=["blocks"],
+            timeout_seconds=_json_timeout(deadline),
+        )
+    except (ValueError, ProviderHttpError) as failure:
+        _emit({"type": "note", "message": "section write failed: {0}".format(failure)})
+        return _suspend(
+            "write_section", "section write failed: {0}".format(failure)
+        )
+
+    normalized_blocks = normalize_blocks(
+        written.get("blocks") or [], section_id=section.get("id") or ""
+    )
+    combined_blocks = list(state.get("blocks") or []) + normalized_blocks
+    updated_plan = mark_written(plan, section.get("id") or "")
+
+    _emit(
+        {
+            "type": "blocks_delta",
+            "section_id": section.get("id"),
+            "count": len(normalized_blocks),
+            "blocks": normalized_blocks,
+            "written": written_count(updated_plan),
+            "total": len(updated_plan),
+        }
     )
 
-    normalized_blocks = normalize_blocks(written.get("blocks") or [])
-    _emit({"type": "blocks", "count": len(normalized_blocks), "blocks": normalized_blocks})
-
-    return {"blocks": normalized_blocks, "phase": "done", "suspended": False}
+    still_pending = next_unwritten(updated_plan)
+    result = {
+        "blocks": combined_blocks,
+        "plan": updated_plan,
+        "suspended": False,
+    }
+    if still_pending is None:
+        result["phase"] = "done"
+        return result
+    if deadline.has_room_for(NODE_TIME_REQUIREMENTS["write_section"]):
+        result["phase"] = "write_section"
+        return result
+    result.update(
+        _suspend("write_section", "section written; pausing before the next")
+    )
+    return result
 
 
 VALID_BLOCK_KINDS = ("heading", "paragraph", "aside", "gap")
 VALID_BLOCK_STATUSES = ("verified", "contested", "unverified", "inferred")
 
 
-def normalize_blocks(raw_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def normalize_blocks(
+    raw_blocks: List[Dict[str, Any]], section_id: str = ""
+) -> List[Dict[str, Any]]:
     """Coerce model output into the block contract the editor relies on.
 
     The model is sloppy about enums — it has been observed putting a float into
@@ -739,22 +1041,34 @@ def normalize_blocks(raw_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if block_status in ("verified", "contested") and not cleaned_sources:
             block_status = "unverified"
 
-        normalized.append(
-            {
-                "id": "blk_{0}_{1}".format(int(time.time() * 1000), block_index),
-                "kind": block_kind,
-                "text": block_text,
-                "sources": cleaned_sources,
-                "status": block_status,
-                "origin": "lesson",
-            }
-        )
+        block_record = {
+            "id": "blk_{0}_{1}".format(int(time.time() * 1000), block_index),
+            "kind": block_kind,
+            "text": block_text,
+            "sources": cleaned_sources,
+            "status": block_status,
+            "origin": "lesson",
+        }
+        if section_id:
+            block_record["section_id"] = section_id
+        normalized.append(block_record)
     return normalized
 
 
 def _choose_entry(state: ResearchState) -> str:
     phase = state.get("phase") or "scope"
-    if phase in ("scope", "research", "distill", "gap_check", "write"):
+    if phase == "write":
+        return "write_section"
+    if phase in (
+        "scope",
+        "brainstorm",
+        "plan",
+        "research",
+        "distill",
+        "revise_plan",
+        "gap_check",
+        "write_section",
+    ):
         return phase
     return "done"
 
@@ -771,29 +1085,47 @@ def _route_after(state: ResearchState) -> str:
 def build_research_graph():
     builder = StateGraph(ResearchState)
     builder.add_node("scope", scope_node)
+    builder.add_node("brainstorm", brainstorm_node)
+    builder.add_node("plan", plan_node)
     builder.add_node("research", research_node)
     builder.add_node("distill", distill_node)
+    builder.add_node("revise_plan", revise_plan_node)
     builder.add_node("gap_check", gap_check_node)
-    builder.add_node("write", write_node)
+    builder.add_node("write_section", write_section_node)
 
     entry_targets = {
         "scope": "scope",
+        "brainstorm": "brainstorm",
+        "plan": "plan",
         "research": "research",
         "distill": "distill",
+        "revise_plan": "revise_plan",
         "gap_check": "gap_check",
-        "write": "write",
+        "write_section": "write_section",
         "done": END,
     }
     builder.add_conditional_edges(START, _choose_entry, entry_targets)
 
     onward_targets = {
+        "brainstorm": "brainstorm",
+        "plan": "plan",
         "research": "research",
         "distill": "distill",
+        "revise_plan": "revise_plan",
         "gap_check": "gap_check",
-        "write": "write",
+        "write_section": "write_section",
         END: END,
     }
-    for node_name in ("scope", "research", "distill", "gap_check", "write"):
+    for node_name in (
+        "scope",
+        "brainstorm",
+        "plan",
+        "research",
+        "distill",
+        "revise_plan",
+        "gap_check",
+        "write_section",
+    ):
         builder.add_conditional_edges(node_name, _route_after, onward_targets)
 
     return builder.compile()
@@ -824,13 +1156,35 @@ def run_research_slice(
     }
 
     latest_state: Dict[str, Any] = dict(state)
-    for stream_mode, payload in RESEARCH_GRAPH.stream(
-        state, config=graph_config, stream_mode=["custom", "values"]
-    ):
-        if stream_mode == "custom":
-            yield payload
-        elif stream_mode == "values":
-            latest_state = payload
+    try:
+        for stream_mode, payload in RESEARCH_GRAPH.stream(
+            state, config=graph_config, stream_mode=["custom", "values"]
+        ):
+            if stream_mode == "custom":
+                yield payload
+            elif stream_mode == "values":
+                latest_state = payload
+    except Exception as graph_failure:  # noqa: BLE001 - must return a terminal event
+        # A raised distill/write failure used to kill the SSE stream with no
+        # `done` or `suspended`, which the browser reported as "the stream ended
+        # without finishing or suspending". Hand the checkpoint back so the next
+        # slice can retry the same phase.
+        latest_state = dict(latest_state)
+        latest_state["suspended"] = True
+        latest_state["suspend_reason"] = "{0}: {1}".format(
+            type(graph_failure).__name__, str(graph_failure)
+        )
+        yield {
+            "type": "suspend",
+            "phase": latest_state.get("phase") or "scope",
+            "reason": latest_state["suspend_reason"],
+        }
+        yield {
+            "type": "suspended",
+            "state": latest_state,
+            "elapsed_seconds": round(deadline.elapsed(), 1),
+        }
+        return
 
     is_finished = (latest_state.get("phase") == "done") and bool(
         latest_state.get("blocks")

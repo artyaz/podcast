@@ -285,6 +285,173 @@ Be hard on yourself here. A conclusion resting on one unverified recollection is
     )
 
 
+def brainstorm_prompt(topic: str, scope_digest: str, subtopics_text: str = "") -> str:
+    spine = ""
+    if subtopics_text:
+        spine = (
+            "The listener already chose these segments; treat them as the "
+            "starting spine, not as a ceiling:\n\n{0}\n".format(subtopics_text)
+        )
+    return """Topic: {0}
+
+How it was scoped:
+{1}
+{2}
+Brainstorm before any plan is written. Return one JSON object:
+
+  "tensions"     — array of 4 to 8 real tensions in the subject. Each is one
+                   sentence naming two forces that do not resolve into each other.
+  "must_hunt"    — array of 5 to 10 load-bearing facts, holdings, datasets, or
+                   documents this episode is worthless without. Be specific:
+                   name the statute, the pollster, the court, the year.
+  "thin_episode" — array of 3 to 6 ways a lazy version of this episode would
+                   stay thin (a missing primary source, a halo-effect rating
+                   treated as electoral math, a ministry press line taken as
+                   audit). Name the failure mode, not a vibe.
+  "surprises"    — array of 3 to 5 framings that are not the public argument
+                   about this subject. What would make a listener sit up.
+
+Do not write the lesson. Do not search. This is a thinking pass so the plan
+that follows has something to be responsible to.""".format(
+        topic, scope_digest, spine
+    )
+
+
+def plan_prompt(
+    topic: str,
+    scope_digest: str,
+    brainstorm_digest: str,
+    subtopics_text: str = "",
+    section_count: int = 6,
+) -> str:
+    spine = ""
+    if subtopics_text:
+        spine = (
+            "The listener already chose these segments. Use them as the plan "
+            "titles, in this order, and write an angle for each that says what "
+            "the section must establish. You may insert at most two extra "
+            "sections if the brainstorm revealed a hole the spine does not "
+            "cover, and you may not drop any chosen segment.\n\n{0}\n".format(
+                subtopics_text
+            )
+        )
+    return """Topic: {0}
+
+Scope:
+{1}
+
+Brainstorm:
+{2}
+{3}
+Write the episode plan. Return one JSON object:
+
+  "plan" — array of {4} to {5} objects, each with:
+      "title" — a short spoken title, the content, not "Background"
+      "angle" — two sentences: what this section must establish, and which
+                must-hunt items it is responsible for. A section whose angle
+                could be satisfied by a summary paragraph is too vague.
+
+Rules. Cover the disagreement, not just the consensus. Put the load-bearing
+empirical work in its own sections rather than sprinkling numbers through a
+tour. End with the question the evidence cannot yet settle, if there is one.
+Together the sections should produce a long episode — this is a chapter list
+for a forty-minute listen, not a five-paragraph explainer.""".format(
+        topic,
+        scope_digest,
+        brainstorm_digest,
+        spine,
+        max(5, section_count - 1),
+        max(section_count, 8),
+    )
+
+
+def revise_plan_prompt(
+    topic: str,
+    plan_digest: str,
+    findings_digest: str,
+    gap_reasoning: str = "",
+) -> str:
+    return """Topic: {0}
+
+Current plan (do not rewrite it):
+{1}
+
+Findings this session:
+{2}
+
+{3}
+Revise the plan by patching individual lines. Return one JSON object:
+
+  "patches" — array of line edits. Each edit is one of:
+      {{"action": "replace", "id": "sec_N", "title": "...", "angle": "..."}}
+      {{"action": "insert", "after_id": "sec_N", "title": "...", "angle": "..."}}
+      {{"action": "delete", "id": "sec_N"}}
+
+  after_id may be "" to prepend. Omit title or angle on replace to leave that
+  field alone.
+
+Rules. Do not return a new plan. Do not replace every line. Edit only where
+the findings made a section's angle wrong, too thin, or in the wrong order.
+Insert a section when the findings opened a question the plan never named.
+Delete only a section the evidence showed was the same as another. If the
+plan still fits, return {{"patches": []}}.""".format(
+        topic,
+        plan_digest,
+        findings_digest,
+        ("Gap audit: {0}".format(gap_reasoning) if gap_reasoning else ""),
+    )
+
+
+def section_writing_prompt(
+    topic: str,
+    section_title: str,
+    section_angle: str,
+    section_index: int,
+    section_count: int,
+    scope_digest: str,
+    findings_digest: str,
+    previous_titles: str,
+    target_block_count: int,
+) -> str:
+    return """Write one section of the lesson, not the whole lesson.
+
+Topic: {0}
+This is section {1} of {2}: {3}
+What this section must establish: {4}
+
+Sections already written (do not recap them):
+{5}
+
+How the question was scoped:
+{6}
+
+What the research established (use this; do not invent sources):
+{7}
+
+Write {8} to {9} blocks covering ONLY this section. This is a spoken chapter,
+not a summary paragraph. A thin section is a failure — develop the argument,
+name the evidence, keep disagreements standing, and say plainly what you
+could not establish. Every load-bearing claim names its source in speech
+and attaches it in metadata.
+
+Open inside the section, not with a recap of the topic. The listener may
+start playback here.
+
+{10}""".format(
+        topic,
+        section_index,
+        section_count,
+        section_title,
+        section_angle,
+        previous_titles or "(this is the first section)",
+        scope_digest,
+        findings_digest,
+        max(6, target_block_count - 2),
+        max(target_block_count, 8),
+        BLOCK_FORMAT_CONTRACT,
+    )
+
+
 def lesson_writing_prompt(
     topic: str,
     scope_digest: str,

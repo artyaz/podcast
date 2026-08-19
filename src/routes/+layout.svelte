@@ -1,23 +1,27 @@
 <script lang="ts">
 	import '../app.css';
 	import { page } from '$app/state';
+	import VaultGate from '$lib/components/VaultGate.svelte';
+	import { backToLibrary } from '$lib/library.svelte';
 
 	let { children } = $props();
 </script>
 
-<div class="shell">
-	<header>
-		<a class="wordmark" href="/">Praxis</a>
-		<nav>
-			<a href="/" class:on={page.url.pathname === '/'}>Lesson</a>
-			<a href="/settings" class:on={page.url.pathname === '/settings'}>Settings</a>
-		</nav>
-	</header>
+<VaultGate>
+	<div class="shell">
+		<header>
+			<a class="wordmark" href="/" onclick={backToLibrary}>Praxis</a>
+			<nav>
+				<a href="/" class:on={page.url.pathname === '/'} onclick={backToLibrary}>Library</a>
+				<a href="/settings" class:on={page.url.pathname === '/settings'}>Settings</a>
+			</nav>
+		</header>
 
-	<main>
-		{@render children()}
-	</main>
-</div>
+		<main>
+			{@render children()}
+		</main>
+	</div>
+</VaultGate>
 
 <style>
 	.shell {

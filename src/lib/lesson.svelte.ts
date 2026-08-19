@@ -23,6 +23,13 @@ export interface SourceReference {
 	title?: string;
 }
 
+export interface PlanItem {
+	id: string;
+	title: string;
+	angle?: string;
+	status?: 'pending' | 'written';
+}
+
 export interface Block {
 	id: string;
 	kind: BlockKind;
@@ -32,6 +39,8 @@ export interface Block {
 	origin: BlockOrigin;
 	/** True while the model is still working on this block's content. */
 	pending?: boolean;
+	/** Plan section this block belongs to, when the episode is written in chapters. */
+	sectionId?: string;
 }
 
 export interface ResearchActivity {
@@ -44,6 +53,8 @@ interface LessonState {
 	topic: string;
 	/** The chosen episode spine, empty when the topic was researched freely. */
 	subtopics: { title: string; angle?: string }[];
+	/** Chapter list the writer walks, one section at a time. */
+	plan: PlanItem[];
 	blocks: Block[];
 	/** The backend's research checkpoint. Kept so an inline ask can reuse findings. */
 	researchState: Record<string, unknown> | null;
@@ -58,6 +69,7 @@ interface LessonState {
 export const lesson = $state<LessonState>({
 	topic: '',
 	subtopics: [],
+	plan: [],
 	blocks: [],
 	researchState: null,
 	running: false,
@@ -68,6 +80,17 @@ export const lesson = $state<LessonState>({
 	errorMessage: ''
 });
 
+let persistHook: (() => void) | null = null;
+
+/** Library (and the vault) register here so every mutation hits IndexedDB. */
+export function onLessonChange(hook: () => void) {
+	persistHook = hook;
+}
+
+function touch() {
+	persistHook?.();
+}
+
 const MAXIMUM_SLICES = 14;
 
 function newBlockId(): string {
@@ -77,6 +100,7 @@ function newBlockId(): string {
 function note(entry: ResearchActivity) {
 	lesson.activity.push(entry);
 	if (lesson.activity.length > 200) lesson.activity.splice(0, lesson.activity.length - 200);
+	touch();
 }
 
 /**
@@ -177,6 +201,30 @@ function absorbResearchEvent(event: Record<string, unknown>): void {
 		note({ kind: 'error', text: event.error as string });
 	} else if (eventType === 'note') {
 		note({ kind: 'note', text: event.message as string });
+	} else if (eventType === 'plan') {
+		lesson.plan = ((event.plan as PlanItem[]) || []).map((item) => ({ ...item }));
+		note({
+			kind: 'phase',
+			text: `Plan: ${lesson.plan.length} sections`,
+			detail: lesson.plan.map((item) => item.title).join('\n')
+		});
+	} else if (eventType === 'brainstorm') {
+		const tensions = (event.tensions as string[]) || [];
+		note({
+			kind: 'phase',
+			text: 'Brainstorm',
+			detail: tensions.slice(0, 4).join('\n')
+		});
+	} else if (eventType === 'blocks_delta') {
+		const incoming = ((event.blocks as Block[]) || []).map((block) => ({
+			...block,
+			pending: false
+		}));
+		lesson.blocks = [...lesson.blocks, ...incoming];
+		note({
+			kind: 'note',
+			text: `Wrote ${(event.count as number) || incoming.length} blocks (${event.written}/${event.total})`
+		});
 	}
 }
 
@@ -189,6 +237,7 @@ export async function runResearch(
 ): Promise<void> {
 	lesson.topic = topic;
 	lesson.subtopics = subtopics;
+	lesson.plan = [];
 	lesson.blocks = [];
 	lesson.researchState = null;
 	lesson.running = true;
@@ -196,6 +245,7 @@ export async function runResearch(
 	lesson.errorMessage = '';
 	lesson.activity = [];
 	lesson.slicesUsed = 0;
+	touch();
 
 	let carriedState: Record<string, unknown> | null = null;
 
@@ -240,12 +290,34 @@ export async function runResearch(
 				absorbResearchEvent(event);
 			}
 
+			if (sliceOutcome === 'done' || sliceOutcome === 'suspended') {
+				const checkpoint = carriedState || {};
+				if (Array.isArray(checkpoint.plan)) {
+					lesson.plan = checkpoint.plan as PlanItem[];
+				}
+				if (Array.isArray(checkpoint.blocks) && checkpoint.blocks.length >= lesson.blocks.length) {
+					lesson.blocks = (checkpoint.blocks as Block[]).map((block) => ({
+						...block,
+						pending: false
+					}));
+				}
+				touch();
+			}
+
 			if (sliceOutcome === 'done') {
 				lesson.finished = true;
 				lesson.phase = 'done';
+				touch();
 				return;
 			}
 			if (sliceOutcome !== 'suspended') {
+				if (carriedState) {
+					note({
+						kind: 'note',
+						text: 'stream dropped — retrying from last checkpoint'
+					});
+					continue;
+				}
 				throw new Error('the stream ended without finishing or suspending');
 			}
 		}
@@ -255,6 +327,7 @@ export async function runResearch(
 		note({ kind: 'error', text: lesson.errorMessage });
 	} finally {
 		lesson.running = false;
+		touch();
 	}
 }
 
@@ -304,6 +377,7 @@ export async function askAt(afterBlockId: string | null, questionText: string): 
 	};
 
 	lesson.blocks.splice(insertAtIndex, 0, questionBlock, placeholderBlock);
+	touch();
 
 	try {
 		const response = await postForStream('/api/ask', {
@@ -373,11 +447,48 @@ export function updateBlockText(blockId: string, nextText: string): void {
 	if (lesson.blocks[blockIndex].origin === 'lesson') {
 		lesson.blocks[blockIndex].origin = 'user';
 	}
+	touch();
 }
 
 export function removeBlock(blockId: string): void {
 	const blockIndex = indexOfBlock(blockId);
 	if (blockIndex >= 0) lesson.blocks.splice(blockIndex, 1);
+	touch();
+}
+
+export function splitBlockAt(blockId: string, offset: number): string | null {
+	const blockIndex = indexOfBlock(blockId);
+	if (blockIndex < 0) return null;
+	const block = lesson.blocks[blockIndex];
+	const safeOffset = Math.max(0, Math.min(offset, block.text.length));
+	const before = block.text.slice(0, safeOffset);
+	const after = block.text.slice(safeOffset);
+	block.text = before;
+	if (block.origin === 'lesson') block.origin = 'user';
+	const created: Block = {
+		id: newBlockId(),
+		kind: 'paragraph',
+		text: after,
+		sources: [],
+		status: 'unverified',
+		origin: 'user',
+		sectionId: block.sectionId
+	};
+	lesson.blocks.splice(blockIndex + 1, 0, created);
+	touch();
+	return created.id;
+}
+
+export function mergeBlockWithPrevious(blockId: string): string | null {
+	const blockIndex = indexOfBlock(blockId);
+	if (blockIndex <= 0) return null;
+	const current = lesson.blocks[blockIndex];
+	const previous = lesson.blocks[blockIndex - 1];
+	previous.text = `${previous.text}${current.text}`;
+	if (previous.origin === 'lesson') previous.origin = 'user';
+	lesson.blocks.splice(blockIndex, 1);
+	touch();
+	return previous.id;
 }
 
 export function lessonAsPlainText(): string {

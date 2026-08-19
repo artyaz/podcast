@@ -134,7 +134,7 @@ const emptySettings: Settings = {
 	speechifyEmotion: 'energetic',
 	minimumRounds: 2,
 	maximumRounds: 5,
-	targetBlockCount: 12,
+	targetBlockCount: 8,
 	budgetSeconds: 200,
 	backendBaseUrl: ''
 };
@@ -156,9 +156,34 @@ function load(): Settings {
 
 export const settings = $state<Settings>(load());
 
+let persistHook: (() => void) | null = null;
+
+/** The vault registers here so API keys stop living in plaintext localStorage. */
+export function onSettingsChange(hook: (() => void) | null) {
+	persistHook = hook;
+}
+
 export function save() {
 	if (!browser) return;
-	localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+	const snapshot = persistHook
+		? {
+				...JSON.parse(JSON.stringify(settings)),
+				keys: { openrouter: [], exa: [], firecrawl: [], speechify: [] }
+			}
+		: settings;
+	localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+	persistHook?.();
+}
+
+export function hydrateSettings(payload: Partial<Settings>) {
+	if (!payload || typeof payload !== 'object') return;
+	const next = {
+		...emptySettings,
+		...payload,
+		keys: { ...emptySettings.keys, ...(payload.keys || {}) },
+		usage: { ...emptySettings.usage, ...(payload.usage || {}) }
+	};
+	Object.assign(settings, next);
 }
 
 /** Parse a textarea of keys, one per line, dropping blanks and duplicates. */

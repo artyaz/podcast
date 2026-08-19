@@ -186,6 +186,24 @@ SPEECHIFY_EMOTIONS = ["neutral", "calm", "cheerful", "energetic", "sad"]
 MAX_TOOL_ITERATIONS_DEFAULT = 14
 
 
+def profile_for_json(profile: LlmProfile) -> LlmProfile:
+    """Structured JSON calls cannot afford reasoning tokens.
+
+    A measured distill call with reasoning on spent 3623 tokens and 165 seconds
+    thinking, emitted zero content, then was cancelled by the gateway. The graph
+    never got a `done` or `suspended` event, so the browser reported that the
+    stream ended without finishing. Reasoning is useful in the tool loop; it is
+    poison for `response_format: json_object`.
+    """
+    return LlmProfile(
+        base_url=profile.base_url,
+        model=profile.model,
+        reasoning={"enabled": False},
+        transcribe_model=profile.transcribe_model,
+        speech_model=profile.speech_model,
+    )
+
+
 def chat_completion(
     vault: SecretVault,
     messages: List[Dict[str, Any]],
@@ -194,6 +212,7 @@ def chat_completion(
     max_tokens: int = 2000,
     temperature: float = 0.7,
     force_json_object: bool = False,
+    timeout_seconds: float = 120.0,
 ) -> Dict[str, Any]:
     """One round trip to the model. Returns the raw response body."""
     profile = profile or LlmProfile()
@@ -228,7 +247,10 @@ def chat_completion(
         }
         try:
             response_body = post_json(
-                profile.chat_url, headers=headers, payload=build_payload(True)
+                profile.chat_url,
+                headers=headers,
+                payload=build_payload(True),
+                timeout_seconds=timeout_seconds,
             )
         except ProviderHttpError as http_error:
             # Some models refuse to have reasoning switched off: OpenRouter answers
@@ -240,10 +262,20 @@ def chat_completion(
                 http_error.body_text or ""
             ).lower():
                 response_body = post_json(
-                    profile.chat_url, headers=headers, payload=build_payload(False)
+                    profile.chat_url,
+                    headers=headers,
+                    payload=build_payload(False),
+                    timeout_seconds=timeout_seconds,
                 )
             else:
                 raise
+        finish_reason = ((response_body.get("choices") or [{}])[0]).get("finish_reason")
+        if str(finish_reason or "").lower() in ("cancelled", "canceled"):
+            raise ProviderHttpError(
+                504,
+                "the model cancelled the completion before producing an answer "
+                "(finish_reason={0})".format(finish_reason),
+            )
         reported_cost = float((response_body.get("usage") or {}).get("cost") or 0.0)
         return response_body, {"dollars": reported_cost}
 
@@ -378,6 +410,9 @@ def run_tool_loop(
                 tools_enabled=True,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                timeout_seconds=120.0 if deadline is None else max(
+                    25.0, deadline.remaining() - 20.0
+                ),
             )
         except ProviderHttpError as call_failure:
             # A gateway that cannot serve a tool call — one was measured answering
@@ -493,13 +528,17 @@ def chat_json(
     attempts: int = 3,
     required_keys: Optional[List[str]] = None,
     required_non_empty: Optional[List[str]] = None,
+    timeout_seconds: float = 90.0,
 ) -> Dict[str, Any]:
     """Ask for a JSON object and keep asking until a complete one parses.
 
-    `max_tokens` defaults high on purpose: the observed failure mode is not bad
-    syntax, it is a response cut off mid-string by the token ceiling. Reasoning
-    makes that worse because reasoning tokens come out of the same budget, so the
-    profile's allowance is added on top.
+    Reasoning is forced off for this path. A distill call with reasoning on was
+    measured spending 165 seconds and 3623 tokens on thinking, emitting no JSON,
+    then being cancelled — which killed the research stream. Structured output
+    needs tokens in `content`, not a hidden chain of thought.
+
+    `max_tokens` still defaults high because the observed failure mode without
+    reasoning is a response cut off mid-string by the token ceiling.
 
     The two `required_*` arguments guard the quieter failure. This model will
     happily return syntactically perfect JSON with the right keys and nothing in
@@ -509,10 +548,10 @@ def chat_json(
     legitimately-false boolean like "ready" needs; `required_non_empty` checks it
     actually has content, which is what a list of questions or blocks needs.
     """
-    profile = profile or LlmProfile()
+    profile = profile_for_json(profile or LlmProfile())
     conversation = list(messages)
     last_raw_text = ""
-    effective_max_tokens = max_tokens + profile.reasoning_token_allowance()
+    effective_max_tokens = max_tokens
 
     for attempt_index in range(attempts):
         response_body = chat_completion(
@@ -523,12 +562,20 @@ def chat_json(
             max_tokens=effective_max_tokens,
             temperature=temperature,
             force_json_object=True,
+            timeout_seconds=timeout_seconds,
         )
         choices = response_body.get("choices") or []
         if not choices:
             continue
         was_truncated = choices[0].get("finish_reason") == "length"
         last_raw_text = (choices[0].get("message") or {}).get("content") or ""
+        if not last_raw_text.strip():
+            last_raw_text = "empty content (finish_reason={0})".format(
+                choices[0].get("finish_reason")
+            )
+            if attempt_index < attempts - 1:
+                continue
+            break
 
         parsed_object = _extract_json_object(
             last_raw_text, allow_brace_slice=not was_truncated

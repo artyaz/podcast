@@ -1,6 +1,13 @@
 <script lang="ts">
 	import { isActive, playFrom, playback, stopPlayback } from '$lib/audio.svelte';
-	import { askAt, lesson, removeBlock, type Block } from '$lib/lesson.svelte';
+	import {
+		askAt,
+		lesson,
+		mergeBlockWithPrevious,
+		removeBlock,
+		splitBlockAt,
+		type Block
+	} from '$lib/lesson.svelte';
 
 	interface BlockViewProps {
 		block: Block;
@@ -77,10 +84,58 @@
 		await askAt(anchorBlockId, questionText);
 	}
 
+	function caretOffset(element: HTMLElement): number {
+		const selection = window.getSelection();
+		if (!selection || selection.rangeCount === 0) return 0;
+		const range = selection.getRangeAt(0);
+		const prefix = range.cloneRange();
+		prefix.selectNodeContents(element);
+		prefix.setEnd(range.endContainer, range.endOffset);
+		return prefix.toString().length;
+	}
+
+	function focusBlock(blockId: string, offset: number) {
+		const element = document.querySelector<HTMLElement>(`[data-block-id="${blockId}"]`);
+		if (!element) return;
+		element.focus();
+		const selection = window.getSelection();
+		if (!selection) return;
+		const textNode = element.firstChild;
+		const range = document.createRange();
+		if (textNode && textNode.nodeType === Node.TEXT_NODE) {
+			const position = Math.max(0, Math.min(offset, textNode.textContent?.length || 0));
+			range.setStart(textNode, position);
+			range.collapse(true);
+		} else {
+			range.selectNodeContents(element);
+			range.collapse(offset === 0);
+		}
+		selection.removeAllRanges();
+		selection.addRange(range);
+	}
+
 	function handleKeydown(event: KeyboardEvent) {
 		if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
 			event.preventDefault();
 			submitQuestion();
+			return;
+		}
+		if (event.key === 'Enter' && !event.shiftKey) {
+			event.preventDefault();
+			const element = event.currentTarget as HTMLElement;
+			const createdId = splitBlockAt(block.id, caretOffset(element));
+			if (createdId) queueMicrotask(() => focusBlock(createdId, 0));
+			return;
+		}
+		if (event.key === 'Backspace') {
+			const element = event.currentTarget as HTMLElement;
+			if (caretOffset(element) !== 0) return;
+			const previousId = mergeBlockWithPrevious(block.id);
+			if (!previousId) return;
+			event.preventDefault();
+			const previous = lesson.blocks.find((candidate) => candidate.id === previousId);
+			const caret = Math.max(0, (previous?.text.length || 0) - block.text.length);
+			queueMicrotask(() => focusBlock(previousId, caret));
 		}
 	}
 
@@ -123,6 +178,7 @@
 		<div
 			class="text"
 			contenteditable="true"
+			data-block-id={block.id}
 			bind:innerText={block.text}
 			oninput={handleInput}
 			onfocus={handleFocus}

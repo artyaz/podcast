@@ -22,6 +22,7 @@
 		type ModelCapability,
 		type ProviderName
 	} from '$lib/settings.svelte';
+	import { vault } from '$lib/vault';
 
 	let modelCatalogue = $state<ModelCapability[]>([]);
 	let modelQuery = $state('');
@@ -237,12 +238,27 @@
 	<h1>Settings</h1>
 
 	<p class="warn">
-		Every key here is stored in <strong>this browser only</strong> and sent with each request.
-		Nothing is baked into the deployment and nothing is stored on the server. Add several keys per
-		provider and they are rotated automatically — Firecrawl by its real remaining credits,
-		the others by least-spent-first, and any key is dropped for the rest of a request as soon as it
-		answers with rejected, out-of-credit, or rate-limited.
+		Every key here is stored in <strong>this browser only</strong>, encrypted with your vault key,
+		and sent with each request. The server never sees plaintext. Add several keys per provider and
+		they are rotated automatically — Firecrawl by its real remaining credits, the others by
+		least-spent-first, and any key is dropped for the rest of a request as soon as it answers with
+		rejected, out-of-credit, or rate-limited.
 	</p>
+
+	<section>
+		<h2>Vault</h2>
+		<p class="hint">
+			This key encrypts lessons and API keys. It is shown from this session only. If you lose it,
+			the ciphertext cannot be recovered. Cross-device sync uses Vercel KV when
+			<code>KV_REST_API_URL</code> and <code>KV_REST_API_TOKEN</code> are set on the backend;
+			otherwise rows stay in this browser and in a local file during development.
+		</p>
+		{#if vault.key}
+			<code class="keyline">{vault.key}</code>
+		{:else}
+			<p class="hint">Unlock the vault from the home screen to see the key.</p>
+		{/if}
+	</section>
 
 	{#each PROVIDER_NAMES as provider (provider)}
 		<section>
@@ -643,8 +659,8 @@
 			<input type="number" min="1" max="10" bind:value={settings.maximumRounds} onchange={save} />
 		</label>
 		<label>
-			<span>Blocks to aim for in an episode</span>
-			<input type="number" min="4" max="40" bind:value={settings.targetBlockCount} onchange={save} />
+			<span>Blocks to aim for in each section</span>
+			<input type="number" min="4" max="20" bind:value={settings.targetBlockCount} onchange={save} />
 		</label>
 		<label>
 			<span>Seconds per pass</span>
@@ -767,6 +783,16 @@
 		color: var(--muted);
 		margin: 0;
 		line-height: 1.5;
+	}
+	.keyline {
+		display: block;
+		padding: 12px 14px;
+		border: 1.5px solid var(--line);
+		border-radius: 13px;
+		background: var(--panel);
+		font-size: 14px;
+		letter-spacing: 0.03em;
+		word-break: break-all;
 	}
 	label {
 		display: flex;

@@ -4,6 +4,16 @@
 	import BlockView from '$lib/components/BlockView.svelte';
 	import SubtopicModal from '$lib/components/SubtopicModal.svelte';
 	import { playFrom, playback, stopPlayback } from '$lib/audio.svelte';
+	import {
+		activeLesson,
+		backToLibrary,
+		backToTopics,
+		createLesson,
+		library,
+		openLesson,
+		openSection,
+		sectionBlocks
+	} from '$lib/library.svelte';
 	import { lesson, runResearch, type Block } from '$lib/lesson.svelte';
 	import { canResearch, settings } from '$lib/settings.svelte';
 
@@ -11,68 +21,134 @@
 	let showSubtopicModal = $state(false);
 	let sheetBlock = $state<Block | null>(null);
 	let anchorBlockId = $state<string | null>(null);
-	let showActivity = $state(true);
 
-	const recentActivity = $derived(lesson.activity.slice(-7).reverse());
-	const firstBlockId = $derived(lesson.blocks[0]?.id ?? null);
+	const current = $derived(activeLesson());
+	const visibleBlocks = $derived(sectionBlocks(library.activeSectionId));
+	const firstBlockId = $derived(visibleBlocks[0]?.id ?? null);
+	const activePlanItem = $derived(
+		lesson.plan.find((item) => item.id === library.activeSectionId) ?? null
+	);
+	const recentActivity = $derived(lesson.activity.slice(-5).reverse());
 
-	function begin() {
+	function startResearch(subtopics: { title: string; angle?: string }[] = []) {
 		const topic = topicDraft.trim();
 		if (!topic) return;
-		runResearch(topic);
+		showSubtopicModal = false;
+		createLesson(topic);
+		runResearch(topic, subtopics);
+		topicDraft = '';
+	}
+
+	function begin() {
+		startResearch();
 	}
 
 	function beginWithSegments(subtopics: { title: string; angle?: string }[]) {
-		const topic = topicDraft.trim();
-		showSubtopicModal = false;
-		if (!topic || !subtopics.length) return;
-		runResearch(topic, subtopics);
+		startResearch(subtopics);
+	}
+
+	function writtenCount(record: { plan: { status?: string }[]; finished: boolean }) {
+		if (!record.plan.length) return record.finished ? 1 : 0;
+		return record.plan.filter((item) => item.status === 'written').length;
+	}
+
+	function cardStatus(record: {
+		running: boolean;
+		finished: boolean;
+		phase: string;
+		errorMessage: string;
+		plan: { status?: string }[];
+	}) {
+		if (record.errorMessage) return 'stopped';
+		if (record.running) return record.phase || 'researching';
+		if (record.finished) return 'ready';
+		if (record.plan.some((item) => item.status === 'written')) return 'in progress';
+		return 'draft';
 	}
 </script>
 
-<svelte:head><title>{lesson.topic || 'Praxis'}</title></svelte:head>
+<svelte:head>
+	<title>
+		{library.view === 'library' ? 'Praxis' : lesson.topic || 'Praxis'}
+	</title>
+</svelte:head>
 
-{#if !lesson.topic}
-	<div class="opening">
-		<h1>What should this episode be about?</h1>
-		<p class="lede">
-			Name a question worth arguing about. It gets scoped, researched against primary sources,
-			audited for what is missing, and written to be listened to.
-		</p>
-
-		<textarea
-			bind:value={topicDraft}
-			rows="3"
-			placeholder="Whether rent control reduces housing supply — and what the evidence actually shows"
-			onkeydown={(event) => {
-				if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) begin();
-			}}
-		></textarea>
-
-		{#if canResearch()}
-			<div class="startrow">
-				<button class="primary" onclick={begin} disabled={!topicDraft.trim()}>
-					Research and write it
-				</button>
-				<button
-					class="ghost"
-					onclick={() => (showSubtopicModal = true)}
-					disabled={!topicDraft.trim()}
-					title="Split the subject into evenly divided segments first"
-				>
-					Break into segments
-				</button>
-			</div>
-			<p class="lede small">
-				Breaking it up first divides the subject into segments, spreads the research evenly across
-				them, and makes the episode follow them in order. Useful when a subject is broad enough that
-				one pass would skim it.
+{#if library.view === 'library'}
+	<div class="library">
+		<div class="opening">
+			<h1>What should this episode be about?</h1>
+			<p class="lede">
+				Name a question worth arguing about. It gets scoped, researched against primary sources,
+				audited for what is missing, and written to be listened to — one chapter at a time.
 			</p>
-		{:else}
-			<p class="warn">
-				Add an OpenRouter key and an Exa key in <a href="/settings">Settings</a> first. Nothing is
-				shipped with the app — every key lives in this browser only.
-			</p>
+
+			<textarea
+				bind:value={topicDraft}
+				rows="3"
+				placeholder="Whether rent control reduces housing supply — and what the evidence actually shows"
+				onkeydown={(event) => {
+					if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) begin();
+				}}
+			></textarea>
+
+			{#if canResearch()}
+				<div class="startrow">
+					<button class="primary" onclick={begin} disabled={!topicDraft.trim()}>
+						Research and write it
+					</button>
+					<button
+						class="ghost"
+						onclick={() => (showSubtopicModal = true)}
+						disabled={!topicDraft.trim()}
+						title="Split the subject into evenly divided segments first"
+					>
+						Break into segments
+					</button>
+				</div>
+				<p class="lede small">
+					Breaking it up first divides the subject into segments, spreads the research evenly across
+					them, and makes the episode follow them in order. Useful when a subject is broad enough that
+					one pass would skim it.
+				</p>
+			{:else}
+				<p class="warn">
+					Add an OpenRouter key and an Exa key in <a href="/settings">Settings</a> first. Nothing is
+					shipped with the app — every key lives in this browser only.
+				</p>
+			{/if}
+		</div>
+
+		{#if library.lessons.length}
+			<ul class="cards">
+				{#each library.lessons as record (record.id)}
+					<li>
+						<button class="card" onclick={() => openLesson(record.id)}>
+							<h2>{record.topic}</h2>
+							<p class="cardmeta">
+								<span class="status">{cardStatus(record)}</span>
+								{#if record.plan.length}
+									<span>{writtenCount(record)} of {record.plan.length} sections</span>
+								{/if}
+							</p>
+							{#if record.id === library.activeId && record.running}
+								<ul class="cardactivity">
+									{#each recentActivity.slice(0, 4) as entry, entryIndex (entryIndex)}
+										<li>{entry.text}</li>
+									{/each}
+								</ul>
+							{:else if record.errorMessage}
+								<p class="carderror">{record.errorMessage}</p>
+							{:else if record.plan.length}
+								<ol class="cardplan">
+									{#each record.plan.slice(0, 4) as item (item.id)}
+										<li class:done={item.status === 'written'}>{item.title}</li>
+									{/each}
+								</ol>
+							{/if}
+						</button>
+					</li>
+				{/each}
+			</ul>
 		{/if}
 	</div>
 
@@ -83,58 +159,55 @@
 			onProceed={beginWithSegments}
 		/>
 	{/if}
-{:else}
-	<div class="lesson" class:hasbar={lesson.blocks.length > 0}>
+{:else if library.view === 'topics'}
+	<div class="topics">
+		<button class="back" onclick={backToLibrary}>← Library</button>
 		<h1 class="topic">{lesson.topic}</h1>
-
-		{#if lesson.subtopics.length}
-			<ol class="spine">
-				{#each lesson.subtopics as segment, segmentIndex (segment.title + segmentIndex)}
-					<li>{segment.title}</li>
+		{#if lesson.running}
+			<p class="lede">{lesson.phase || 'working'} · progress lives on the library card</p>
+		{/if}
+		{#if lesson.errorMessage}
+			<p class="railerror">{lesson.errorMessage}</p>
+		{/if}
+		{#if lesson.plan.length}
+			<ol class="topiclist">
+				{#each lesson.plan as item (item.id)}
+					<li>
+						<button class="topicrow" onclick={() => openSection(item.id)}>
+							<span class="tmark" class:done={item.status === 'written'}></span>
+							<span class="tbody">
+								<span class="ttitle">{item.title}</span>
+								{#if item.angle}<span class="tangle">{item.angle}</span>{/if}
+							</span>
+							<span class="tstat">{item.status === 'written' ? 'ready' : 'pending'}</span>
+						</button>
+					</li>
 				{/each}
 			</ol>
+		{:else}
+			<p class="lede">
+				{lesson.running
+					? 'The plan will land here once the brainstorming pass finishes.'
+					: 'No sections yet.'}
+			</p>
+		{/if}
+	</div>
+{:else}
+	<div class="lesson" class:hasbar={visibleBlocks.length > 0}>
+		<button class="back" onclick={current?.plan.length ? backToTopics : backToLibrary}>
+			{current?.plan.length ? '← Sections' : '← Library'}
+		</button>
+		<h1 class="topic">{activePlanItem?.title || lesson.topic}</h1>
+		{#if activePlanItem?.angle}
+			<p class="lede">{activePlanItem.angle}</p>
 		{/if}
 
-		{#if lesson.running || lesson.errorMessage}
-			<div class="rail">
-				<div class="railhead">
-					<span class="phaselabel">
-						{#if lesson.running}
-							<span class="pulse"></span>
-							{lesson.phase || 'starting'}
-							{#if lesson.slicesUsed > 1}· pass {lesson.slicesUsed}{/if}
-						{:else}
-							stopped
-						{/if}
-					</span>
-					<button class="ghost tiny" onclick={() => (showActivity = !showActivity)}>
-						{showActivity ? 'hide' : 'show'}
-					</button>
-				</div>
-
-				{#if lesson.errorMessage}
-					<p class="railerror">{lesson.errorMessage}</p>
-				{/if}
-
-				{#if showActivity}
-					<ul class="activity">
-						{#each recentActivity as entry, entryIndex (entryIndex)}
-							<li class={entry.kind}>
-								<span class="what">{entry.text}</span>
-								{#if entry.detail}<span class="detail">{entry.detail}</span>{/if}
-							</li>
-						{/each}
-					</ul>
-				{/if}
-			</div>
-		{/if}
-
-		{#if lesson.blocks.length}
+		{#if visibleBlocks.length}
 			<div class="transport">
 				{#if playback.playing}
 					<button class="ghost" onclick={stopPlayback}>◼ Stop</button>
 				{:else if firstBlockId}
-					<button class="ghost" onclick={() => playFrom(firstBlockId)}>▶ Play episode</button>
+					<button class="ghost" onclick={() => playFrom(firstBlockId)}>▶ Play</button>
 				{/if}
 				<span class="voicelabel">
 					{settings.speechProvider === 'speechify'
@@ -145,9 +218,11 @@
 					<span class="playerror">{playback.errorMessage}</span>
 				{/if}
 			</div>
+		{:else if lesson.running}
+			<p class="lede">This section has not been written yet. It will appear here as soon as it is.</p>
 		{/if}
 
-		{#each lesson.blocks as block (block.id)}
+		{#each visibleBlocks as block (block.id)}
 			<BlockView
 				{block}
 				onRequestActions={(target) => (sheetBlock = target)}
@@ -155,32 +230,44 @@
 			/>
 		{/each}
 
-		{#if lesson.finished}
+		{#if lesson.finished && visibleBlocks.length}
 			<p class="footnote">
 				Ask anything below, or put the cursor into any paragraph and type — your question becomes
-				part of the episode, and the answer lands right under it.
+				part of the episode, and the answer lands right under it. Enter starts a new paragraph.
 			</p>
 		{/if}
 	</div>
 
-	{#if lesson.blocks.length}
+	{#if visibleBlocks.length}
 		<AskBar {anchorBlockId} />
 	{/if}
 	<BlockActions block={sheetBlock} onClose={() => (sheetBlock = null)} />
 {/if}
 
 <style>
+	.library,
+	.topics,
+	.lesson {
+		padding-bottom: 40px;
+	}
+	.lesson.hasbar {
+		padding-bottom: 96px;
+	}
 	.opening {
 		display: flex;
 		flex-direction: column;
 		gap: 16px;
-		padding: 12px 0 40px;
+		padding: 12px 0 28px;
 	}
 	h1 {
 		font-family: var(--serif);
 		font-size: 28px;
 		line-height: 1.25;
 		margin: 0;
+	}
+	.topic {
+		font-size: 25px;
+		margin: 0 0 14px;
 	}
 	.lede {
 		margin: 0;
@@ -230,67 +317,128 @@
 		border-radius: 12px;
 		padding: 12px 14px;
 	}
-
-	.lesson {
-		padding-bottom: 40px;
+	.cards {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
 	}
-	.lesson.hasbar {
-		padding-bottom: 96px;
+	.card {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		width: 100%;
+		text-align: left;
+		padding: 16px 16px 14px;
+		border: 1.5px solid var(--line);
+		border-radius: 16px;
+		background: var(--panel);
 	}
-	.topic {
-		font-size: 25px;
-		margin: 0 0 20px;
+	.card h2 {
+		font-family: var(--serif);
+		font-size: 18px;
+		line-height: 1.35;
+		margin: 0;
+		font-weight: 600;
 	}
-
-	.spine {
+	.cardmeta {
+		display: flex;
+		gap: 10px;
+		margin: 0;
+		font-size: 12px;
+		color: var(--muted);
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+	}
+	.cardactivity,
+	.cardplan {
+		margin: 0;
+		padding: 0;
+		list-style: none;
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	.cardactivity li,
+	.cardplan li,
+	.carderror {
+		font-size: 13px;
+		color: var(--muted);
+		line-height: 1.4;
+	}
+	.cardplan {
 		list-style: decimal;
-		margin: -8px 0 22px;
-		padding-left: 20px;
+		padding-left: 18px;
+	}
+	.cardplan li.done {
+		color: var(--ok);
+	}
+	.carderror {
+		color: var(--bad);
+		margin: 0;
+	}
+
+	.back {
+		font-size: 13px;
+		color: var(--muted);
+		margin: 0 0 12px;
+		padding: 0;
+	}
+	.topiclist {
+		list-style: none;
+		margin: 18px 0 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.topicrow {
+		display: flex;
+		gap: 12px;
+		align-items: flex-start;
+		width: 100%;
+		text-align: left;
+		padding: 14px 14px;
+		border: 1.5px solid var(--line);
+		border-radius: 14px;
+		background: var(--panel);
+	}
+	.tmark {
+		width: 9px;
+		height: 9px;
+		margin-top: 6px;
+		border-radius: 50%;
+		border: 1.5px solid var(--line);
+		flex: 0 0 9px;
+	}
+	.tmark.done {
+		background: var(--ok);
+		border-color: var(--ok);
+	}
+	.tbody {
 		display: flex;
 		flex-direction: column;
 		gap: 4px;
+		flex: 1;
+		min-width: 0;
 	}
-	.spine li {
+	.ttitle {
+		font-size: 16px;
+		line-height: 1.35;
+	}
+	.tangle {
 		font-size: 13px;
 		color: var(--muted);
 		line-height: 1.45;
 	}
-	.rail {
-		border: 1px solid var(--line);
-		border-radius: 12px;
-		padding: 11px 13px;
-		margin-bottom: 26px;
-		background: var(--panel);
-	}
-	.railhead {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-	}
-	.phaselabel {
-		display: flex;
-		align-items: center;
-		gap: 7px;
-		font-size: 12px;
-		text-transform: uppercase;
-		letter-spacing: 0.07em;
+	.tstat {
+		font-size: 11px;
 		color: var(--muted);
-	}
-	.pulse {
-		width: 6px;
-		height: 6px;
-		border-radius: 50%;
-		background: var(--ok);
-		animation: breathe 1.4s ease-in-out infinite;
-	}
-	@keyframes breathe {
-		0%,
-		100% {
-			opacity: 0.3;
-		}
-		50% {
-			opacity: 1;
-		}
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		margin-top: 4px;
 	}
 	.railerror {
 		margin: 8px 0 0;
@@ -298,44 +446,12 @@
 		color: var(--bad);
 		line-height: 1.5;
 	}
-	.activity {
-		list-style: none;
-		margin: 9px 0 0;
-		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 6px;
-	}
-	.activity li {
-		font-size: 12.5px;
-		line-height: 1.45;
-		color: var(--muted);
-		display: flex;
-		flex-direction: column;
-	}
-	.activity li.search .what::before {
-		content: '⌕ ';
-	}
-	.activity li.read .what::before {
-		content: '▤ ';
-	}
-	.activity li.gap .what {
-		color: var(--warn);
-	}
-	.activity li.error .what {
-		color: var(--bad);
-	}
-	.activity .detail {
-		font-size: 11.5px;
-		opacity: 0.72;
-		white-space: pre-wrap;
-	}
 
 	.transport {
 		display: flex;
 		align-items: center;
 		gap: 10px;
-		margin-bottom: 22px;
+		margin: 18px 0 22px;
 		flex-wrap: wrap;
 	}
 	.ghost {
@@ -343,11 +459,6 @@
 		border-radius: 999px;
 		border: 1.5px solid var(--line);
 		font-size: 14px;
-	}
-	.ghost.tiny {
-		padding: 3px 9px;
-		font-size: 11px;
-		border-radius: 999px;
 	}
 	.voicelabel {
 		font-size: 12px;

@@ -29,6 +29,7 @@ from .graph import (
     propose_subtopics,
     run_research_slice,
 )
+from .vault_store import load_vault, rows_as_list, upsert_rows
 from .keys import KeyExhausted, SecretVault
 from .transport import (
     ProviderHttpError,
@@ -104,6 +105,15 @@ def _clamped_budget(requested: Any) -> float:
     except (TypeError, ValueError):
         budget = DEFAULT_RESEARCH_BUDGET_SECONDS
     return max(30.0, min(budget, HARD_BUDGET_CEILING_SECONDS))
+
+
+def _clean_vault_id(vault_id: str) -> str:
+    cleaned = (vault_id or "").strip().lower()
+    if not cleaned or len(cleaned) < 16 or len(cleaned) > 128:
+        raise HTTPException(status_code=400, detail="Invalid vault id.")
+    if any(character not in "0123456789abcdef" for character in cleaned):
+        raise HTTPException(status_code=400, detail="Invalid vault id.")
+    return cleaned
 
 
 @app.get("/api/health")
@@ -252,6 +262,32 @@ async def models(request: Request) -> Dict[str, Any]:
         )
 
     return {"models": catalogue, "count": len(catalogue), "usage": vault.export_usage()}
+
+
+@app.get("/api/vault/{vault_id}")
+def read_vault(vault_id: str) -> Dict[str, Any]:
+    """Return the opaque ciphertext rows for this vault. No plaintext here."""
+    cleaned = _clean_vault_id(vault_id)
+    rows = rows_as_list(load_vault(cleaned))
+    return {"rows": rows}
+
+
+@app.put("/api/vault/{vault_id}")
+async def write_vault(vault_id: str, request: Request) -> Dict[str, Any]:
+    """Merge incoming ciphertext rows. Newer updated_at wins per id."""
+    cleaned = _clean_vault_id(vault_id)
+    request_body = await request.json()
+    incoming = request_body.get("rows") or []
+    if not isinstance(incoming, list):
+        raise HTTPException(status_code=400, detail="rows must be an array.")
+    try:
+        merged = upsert_rows(cleaned, incoming)
+    except Exception as failure:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail="Vault storage failed: {0}".format(str(failure)[:200]),
+        )
+    return {"rows": rows_as_list(merged)}
 
 
 @app.post("/api/outline")
@@ -460,6 +496,31 @@ async def speak(request: Request) -> JSONResponse:
             )
     except KeyExhausted as exhausted:
         raise HTTPException(status_code=402, detail=str(exhausted))
+    except ProviderHttpError as provider_error:
+        # Uncaught, this became a FastAPI 500 with no body the player could
+        # display — the UI then showed a bare "HTTP 500". Surface the provider's
+        # own diagnosis so a bad voice, a 4xx from Kokoro, or an upstream 500
+        # is distinguishable.
+        raise HTTPException(
+            status_code=502,
+            detail="{0} speech failed: {1}".format(
+                provider_name, provider_error.diagnosis()
+            ),
+        )
+    except Exception as unexpected:  # noqa: BLE001 - must not become a blank 500
+        raise HTTPException(
+            status_code=502,
+            detail="{0} speech failed: {1}: {2}".format(
+                provider_name, type(unexpected).__name__, str(unexpected)[:240]
+            ),
+        )
+
+    audio_bytes = speech_result.get("audio_bytes") or b""
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=502,
+            detail="{0} returned no audio for that block.".format(provider_name),
+        )
 
     return JSONResponse(
         {

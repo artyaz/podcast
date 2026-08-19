@@ -233,6 +233,15 @@ def collapse_streamed_completion(body_text: str) -> Optional[Dict[str, Any]]:
     if not saw_any_chunk:
         return None
 
+    # A cancelled reasoning stream arrives as many deltas with no `content` and
+    # a finish_reason of cancelled/null. Folding that into a fake completion
+    # with an empty message makes the caller retry on garbage instead of
+    # treating the call as a transport failure.
+    if str(finish_reason or "").lower() in ("cancelled", "canceled") and not "".join(
+        aggregated_content
+    ).strip():
+        return None
+
     assistant_message: Dict[str, Any] = {
         "role": "assistant",
         "content": "".join(aggregated_content),
