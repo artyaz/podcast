@@ -99,6 +99,7 @@
 
 <div
 	class="block"
+	role="group"
 	class:heading={block.kind === 'heading'}
 	class:aside={block.kind === 'aside'}
 	class:gap={block.kind === 'gap'}
@@ -116,7 +117,10 @@
 	{#if block.pending}
 		<p class="text shimmering">{block.text}</p>
 	{:else}
-		<p
+		<!-- A div rather than a p: role="textbox" on a paragraph is a noninteractive
+		     element given an interactive role, which assistive technology reads
+		     inconsistently. The styling is on .text, so both branches match. -->
+		<div
 			class="text"
 			contenteditable="true"
 			bind:innerText={block.text}
@@ -127,7 +131,8 @@
 			role="textbox"
 			tabindex="0"
 			aria-multiline="true"
-		></p>
+			aria-label="Lesson block — type a question here to ask about it"
+		></div>
 	{/if}
 
 	{#if !block.pending}

@@ -140,7 +140,6 @@
 				oninput={(event) => setKeysFromText(provider, event.currentTarget.value)}
 				placeholder="one key per line"
 				autocapitalize="none"
-				autocorrect="off"
 				autocomplete="off"
 				spellcheck="false"
 			></textarea>
