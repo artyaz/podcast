@@ -5,7 +5,7 @@ import {
 	type PlanItem,
 	type ResearchActivity
 } from './lesson.svelte';
-import { putPlain, readPlain } from './vault';
+import { putPlain, readPlain } from './vault.svelte';
 
 export interface LessonRecord {
 	id: string;

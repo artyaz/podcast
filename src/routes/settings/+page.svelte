@@ -22,7 +22,7 @@
 		type ModelCapability,
 		type ProviderName
 	} from '$lib/settings.svelte';
-	import { vault } from '$lib/vault';
+	import { vault } from '$lib/vault.svelte';
 
 	let modelCatalogue = $state<ModelCapability[]>([]);
 	let modelQuery = $state('');

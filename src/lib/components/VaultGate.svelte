@@ -10,7 +10,7 @@
 		unlockVault,
 		vault,
 		vaultIsConfigured
-	} from '$lib/vault';
+	} from '$lib/vault.svelte';
 
 	let { children } = $props();
 
