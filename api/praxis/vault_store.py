@@ -26,7 +26,15 @@ def _vault_path() -> str:
     configured = os.environ.get("PRAXIS_VAULT_PATH")
     if configured:
         return configured
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".vault.json")
+    beside_package = os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".vault.json")
+    )
+    # Vercel Python functions are read-only except /tmp. Writing next to the
+    # package raises Errno 30 and the browser saw HTTP 503 on every unlock.
+    parent = os.path.dirname(beside_package)
+    if os.access(parent, os.W_OK):
+        return beside_package
+    return "/tmp/praxis-vault.json"
 
 
 def _kv_configured() -> bool:
@@ -133,12 +141,17 @@ def save_vault(vault_id: str, rows: Dict[str, Dict[str, Any]]) -> Dict[str, Dict
     if _kv_configured():
         _kv_set(vault_id, payload)
         return rows
-    with _file_lock:
-        stored = _load_file()
-        vaults = stored.get("vaults") if isinstance(stored.get("vaults"), dict) else {}
-        vaults[vault_id] = payload
-        stored["vaults"] = vaults
-        _save_file(stored)
+    try:
+        with _file_lock:
+            stored = _load_file()
+            vaults = stored.get("vaults") if isinstance(stored.get("vaults"), dict) else {}
+            vaults[vault_id] = payload
+            stored["vaults"] = vaults
+            _save_file(stored)
+    except OSError:
+        # IndexedDB is the durable copy. A read-only host without KV should not
+        # fail the request — the next unlock will retry the push.
+        return rows
     return rows
 
 
