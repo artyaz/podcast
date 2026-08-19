@@ -1,0 +1,115 @@
+:root {
+	--bg: #fbfbf9;
+	--panel: #ffffff;
+	--ink: #15140f;
+	--muted: #8a877e;
+	--line: #e9e6df;
+	--ok: #1c7a4d;
+	--warn: #b07400;
+	--bad: #bb3a2c;
+	--serif: 'Iowan Old Style', 'Palatino Linotype', 'Palatino', 'Georgia', serif;
+	--sans: -apple-system, BlinkMacSystemFont, system-ui, 'Segoe UI', Roboto, sans-serif;
+	--safe-top: env(safe-area-inset-top, 0px);
+	--safe-bottom: env(safe-area-inset-bottom, 0px);
+	/* Reading measure for spoken prose: one block is one breath, so the column
+	   stays narrow enough that a paragraph reads as a single unit. */
+	--measure: 34rem;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root {
+		--bg: #0b0b0a;
+		--panel: #151513;
+		--ink: #f1efe9;
+		--muted: #8f8c84;
+		--line: #2a2926;
+		--ok: #56cf90;
+		--warn: #e0a83a;
+		--bad: #ff6f63;
+	}
+}
+
+* {
+	box-sizing: border-box;
+	-webkit-tap-highlight-color: transparent;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
+	text-size-adjust: 100%;
+}
+
+html,
+body {
+	margin: 0;
+	min-height: 100%;
+	background: var(--bg);
+	color: var(--ink);
+	font-family: var(--sans);
+	overscroll-behavior-y: none;
+}
+
+body {
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+}
+
+button {
+	font: inherit;
+	color: inherit;
+	cursor: pointer;
+	border: none;
+	background: none;
+	-webkit-user-select: none;
+	user-select: none;
+}
+
+/* iOS zooms the viewport on focus for anything under 16px. */
+input,
+textarea,
+select {
+	font-size: 16px;
+	font-family: inherit;
+}
+
+a {
+	color: inherit;
+}
+
+/* The shimmer that runs while the model is researching an answer in place.
+   It rides on background-clip so the actual glyphs stay legible — the reader
+   can keep reading their own question while it resolves. */
+@keyframes praxis-shimmer {
+	0% {
+		background-position: 200% 0;
+	}
+	100% {
+		background-position: -200% 0;
+	}
+}
+
+.shimmering {
+	background-image: linear-gradient(
+		90deg,
+		var(--muted) 0%,
+		var(--muted) 35%,
+		var(--ink) 50%,
+		var(--muted) 65%,
+		var(--muted) 100%
+	);
+	background-size: 200% 100%;
+	-webkit-background-clip: text;
+	background-clip: text;
+	color: transparent;
+	animation: praxis-shimmer 2.1s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.shimmering {
+		animation: none;
+		color: var(--muted);
+		background-image: none;
+		-webkit-background-clip: initial;
+		background-clip: initial;
+	}
+}
