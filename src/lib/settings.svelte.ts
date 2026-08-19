@@ -84,6 +84,12 @@ export interface Settings {
 	kokoroVoice: string;
 	speechifyVoice: string;
 	speechifyModel: string;
+	/**
+	 * SSML emotion for Speechify. Only simba-3.2 honours it, and only the five
+	 * documented values — an undocumented one is accepted rather than rejected,
+	 * so it would change delivery unpredictably instead of failing.
+	 */
+	speechifyEmotion: string;
 
 	/** How hard the research loop works before it is allowed to write. */
 	minimumRounds: number;
@@ -123,8 +129,9 @@ const emptySettings: Settings = {
 	subtopicCount: 5,
 	speechProvider: 'kokoro',
 	kokoroVoice: 'af_heart',
-	speechifyVoice: 'alec',
-	speechifyModel: 'simba-3.0',
+	speechifyVoice: 'beatrice_32',
+	speechifyModel: 'simba-3.2',
+	speechifyEmotion: 'energetic',
 	minimumRounds: 2,
 	maximumRounds: 5,
 	targetBlockCount: 12,

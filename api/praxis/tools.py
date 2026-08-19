@@ -13,7 +13,14 @@ checkpoint small enough to travel in a request body across a resume.
 from typing import Any, Dict, List, Optional
 
 from .keys import SecretVault
-from .transport import ProviderHttpError, get_json, post_json, run_with_rotation
+from .transport import (
+    ProviderHttpError,
+    bearer_header,
+    get_json,
+    plain_key,
+    post_json,
+    run_with_rotation,
+)
 
 EXA_SEARCH_URL = "https://api.exa.ai/search"
 FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v2/scrape"
@@ -94,7 +101,7 @@ def exa_search(
     def attempt(api_key: str):
         response_body = post_json(
             EXA_SEARCH_URL,
-            headers={"x-api-key": api_key, "Content-Type": "application/json"},
+            headers={"x-api-key": plain_key(api_key), "Content-Type": "application/json"},
             payload=request_payload,
         )
         reported_cost = float(
@@ -138,7 +145,7 @@ def firecrawl_scrape(vault: SecretVault, url: str) -> Dict[str, Any]:
         response_body = post_json(
             FIRECRAWL_SCRAPE_URL,
             headers={
-                "Authorization": "Bearer {0}".format(api_key),
+                "Authorization": bearer_header(api_key),
                 "Content-Type": "application/json",
             },
             payload={"url": url, "formats": ["markdown"], "onlyMainContent": True},
@@ -155,7 +162,7 @@ def firecrawl_scrape(vault: SecretVault, url: str) -> Dict[str, Any]:
             try:
                 credit_body = get_json(
                     FIRECRAWL_CREDIT_URL,
-                    headers={"Authorization": "Bearer {0}".format(api_key)},
+                    headers={"Authorization": bearer_header(api_key)},
                 )
                 remaining_credits = (credit_body.get("data") or {}).get("remainingCredits")
             except ProviderHttpError:

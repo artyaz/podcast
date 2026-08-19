@@ -952,25 +952,60 @@ def propose_subtopics(
     should be researched until they do. One cheap call, no tools.
     """
     requested = max(2, min(int(subtopic_count or 5), 12))
-    outline = chat_json(
-        vault,
-        messages=[
-            {"role": "system", "content": lesson_research_system_prompt()},
-            {"role": "user", "content": outline_prompt(topic, requested)},
-        ],
-        profile=profile or LlmProfile(),
-        max_tokens=2200,
-        temperature=0.6,
-        required_keys=["subtopics"],
-        required_non_empty=["subtopics"],
-    )
+    profile = profile or LlmProfile()
+    conversation = [
+        {"role": "system", "content": lesson_research_system_prompt()},
+        {"role": "user", "content": outline_prompt(topic, requested)},
+    ]
 
-    proposed: List[Dict[str, str]] = []
-    for entry in outline.get("subtopics") or []:
-        if not isinstance(entry, dict):
-            continue
-        title = str(entry.get("title") or "").strip()
-        if not title:
-            continue
-        proposed.append({"title": title, "angle": str(entry.get("angle") or "").strip()})
-    return proposed[:requested]
+    best_attempt: List[Dict[str, str]] = []
+    # The count is the point of this call — it decides how research effort gets
+    # divided — and asking for an exact number does not reliably produce one. A
+    # request for three segments was observed returning one, which the non-empty
+    # check happily accepted. So the shortfall is named and the model asked again.
+    for attempt_index in range(3):
+        outline = chat_json(
+            vault,
+            messages=conversation,
+            profile=profile,
+            max_tokens=2200,
+            temperature=0.6,
+            required_keys=["subtopics"],
+            required_non_empty=["subtopics"],
+        )
+
+        proposed: List[Dict[str, str]] = []
+        for entry in outline.get("subtopics") or []:
+            if not isinstance(entry, dict):
+                continue
+            title = str(entry.get("title") or "").strip()
+            if not title:
+                continue
+            proposed.append(
+                {"title": title, "angle": str(entry.get("angle") or "").strip()}
+            )
+
+        if len(proposed) > len(best_attempt):
+            best_attempt = proposed
+        if len(proposed) >= requested:
+            return proposed[:requested]
+
+        if attempt_index < 2:
+            conversation = [
+                conversation[0],
+                {"role": "user", "content": outline_prompt(topic, requested)},
+                {
+                    "role": "user",
+                    "content": (
+                        "That returned {0} subtopic{1}, not {2}. Return exactly {2}, "
+                        "each covering a distinct part of the subject, as a JSON "
+                        "object with the key \"subtopics\".".format(
+                            len(proposed),
+                            "" if len(proposed) == 1 else "s",
+                            requested,
+                        )
+                    ),
+                },
+            ]
+
+    return best_attempt[:requested]

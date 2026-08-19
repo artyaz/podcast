@@ -23,16 +23,29 @@ RETIRING_STATUS_CODES = (401, 402, 403, 429)
 
 
 class KeyExhausted(Exception):
-    """Every key for a provider has been retired during this request."""
+    """No usable key remained for a provider during this request.
 
-    def __init__(self, provider_name: str, last_error: str):
-        super().__init__(
-            "all {0} keys are exhausted or rejected; last error: {1}".format(
-                provider_name, last_error
+    The message names which keys were tried and what the provider actually said,
+    because "all keys are exhausted or rejected" is unactionable when you hold
+    several keys — it does not say which one broke, or whether the problem is
+    credit, a typo, or a rate limit.
+    """
+
+    def __init__(self, provider_name: str, last_error: str, attempted=None):
+        attempted = attempted or []
+        if not attempted:
+            summary = "no usable {0} key: {1}".format(provider_name, last_error)
+        else:
+            summary = "no usable {0} key after trying {1} ({2}). Last failure: {3}".format(
+                provider_name,
+                "1 key" if len(attempted) == 1 else "{0} keys".format(len(attempted)),
+                ", ".join(attempted),
+                last_error,
             )
-        )
+        super().__init__(summary)
         self.provider_name = provider_name
         self.last_error = last_error
+        self.attempted = attempted
 
 
 class ProviderKeyPool:

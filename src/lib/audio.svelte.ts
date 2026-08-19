@@ -15,8 +15,14 @@ import { lesson, type Block } from './lesson.svelte';
 
 interface CachedAudio {
 	objectUrl: string;
-	/** The text this audio was made from, so an edit invalidates it. */
+	/**
+	 * What produced this audio. Cached clips are reused only when all of it still
+	 * matches — changing the voice or the emotion has to re-synthesise just as
+	 * surely as editing the words does, or the reader hears the old delivery.
+	 */
 	sourceText: string;
+	sourceVoice: string;
+	sourceEmotion: string;
 	speechMarks: unknown;
 }
 
@@ -52,8 +58,17 @@ function currentVoice(): string {
 }
 
 async function synthesizeBlock(block: Block): Promise<CachedAudio> {
+	const voiceNow = currentVoice();
+	const emotionNow = settings.speechProvider === 'speechify' ? settings.speechifyEmotion : '';
 	const cached = audioCache.get(block.id);
-	if (cached && cached.sourceText === block.text) return cached;
+	if (
+		cached &&
+		cached.sourceText === block.text &&
+		cached.sourceVoice === voiceNow &&
+		cached.sourceEmotion === emotionNow
+	) {
+		return cached;
+	}
 	if (cached) URL.revokeObjectURL(cached.objectUrl);
 
 	const response = await fetch(backendUrl('/api/speak'), {
@@ -62,8 +77,9 @@ async function synthesizeBlock(block: Block): Promise<CachedAudio> {
 		body: JSON.stringify({
 			text: block.text,
 			provider: settings.speechProvider,
-			voice: currentVoice(),
+			voice: voiceNow,
 			speechify_model: settings.speechifyModel,
+			emotion: settings.speechifyEmotion,
 			secrets: secretsPayload(),
 			llm: llmPayload()
 		})
@@ -92,6 +108,8 @@ async function synthesizeBlock(block: Block): Promise<CachedAudio> {
 	const entry: CachedAudio = {
 		objectUrl,
 		sourceText: block.text,
+		sourceVoice: voiceNow,
+		sourceEmotion: emotionNow,
 		speechMarks: payload.speech_marks ?? null
 	};
 	audioCache.set(block.id, entry);

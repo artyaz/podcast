@@ -30,9 +30,18 @@ from .graph import (
     run_research_slice,
 )
 from .keys import KeyExhausted, SecretVault
+from .transport import (
+    ProviderHttpError,
+    bearer_header,
+    get_json,
+    plain_key,
+    post_json,
+)
 from .llm import (
     DEFAULT_CHAT_MODEL,
     KOKORO_VOICES,
+    SPEECHIFY_EMOTIONS,
+    SPEECHIFY_MODELS,
     LlmProfile,
     list_chat_models,
     list_speechify_voices,
@@ -119,20 +128,105 @@ async def voices(request: Request) -> Dict[str, Any]:
     request_body = await request.json()
     vault = _build_vault(request_body)
 
-    speechify_voices: List[Dict[str, Any]] = []
+    # One request per Speechify model, because each model has its own catalogue
+    # rather than a filtered view of a shared one, and a voice from the wrong
+    # catalogue is rejected at synthesis time.
+    speechify_by_model: Dict[str, List[Dict[str, Any]]] = {}
     speechify_error: Optional[str] = None
     if vault.pool("speechify").is_configured():
-        try:
-            speechify_voices = list_speechify_voices(vault)
-        except (KeyExhausted, Exception) as voice_error:  # noqa: BLE001
-            speechify_error = str(voice_error)
+        for model_entry in SPEECHIFY_MODELS:
+            model_identifier = model_entry["id"]
+            try:
+                speechify_by_model[model_identifier] = list_speechify_voices(
+                    vault, model_name=model_identifier
+                )
+            except KeyExhausted as exhausted:
+                speechify_error = str(exhausted)
+                break
+            except Exception as voice_error:  # noqa: BLE001
+                # One model failing should not hide the others.
+                speechify_by_model[model_identifier] = []
+                speechify_error = "{0}: {1}".format(model_identifier, str(voice_error))
 
     return {
         "kokoro": KOKORO_VOICES,
-        "speechify": speechify_voices,
+        "speechify_models": SPEECHIFY_MODELS,
+        "speechify_emotions": SPEECHIFY_EMOTIONS,
+        "speechify_by_model": speechify_by_model,
+        # Kept so an older cached frontend still finds a usable list.
+        "speechify": speechify_by_model.get("simba-3.2")
+        or speechify_by_model.get("simba-3.0")
+        or [],
         "speechify_error": speechify_error,
         "usage": vault.export_usage(),
     }
+
+
+@app.post("/api/keycheck")
+async def keycheck(request: Request) -> Dict[str, Any]:
+    """Test every configured key individually and say which ones work.
+
+    Rotation deliberately hides individual failures — it moves to the next key and
+    only complains once nothing is left. That is right for a research run and
+    useless for debugging, because "no usable openrouter key" does not say which
+    of your three keys is wrong, or whether the problem is a typo, no credit, or a
+    rate limit. This endpoint answers that directly, one cheap authenticated call
+    per key.
+    """
+    request_body = await request.json()
+    vault = _build_vault(request_body)
+    profile = _build_profile(request_body)
+
+    probes = {
+        "openrouter": lambda key: get_json(
+            "{0}/key".format(profile.base_url),
+            headers={"Authorization": bearer_header(key)},
+        ),
+        "exa": lambda key: post_json(
+            "https://api.exa.ai/search",
+            headers={"x-api-key": plain_key(key), "Content-Type": "application/json"},
+            payload={"query": "test", "type": "instant", "numResults": 1},
+        ),
+        "firecrawl": lambda key: get_json(
+            "https://api.firecrawl.dev/v2/team/credit-usage",
+            headers={"Authorization": bearer_header(key)},
+        ),
+        "speechify": lambda key: get_json(
+            "https://api.sws.speechify.com/v1/voices",
+            headers={"Authorization": bearer_header(key)},
+        ),
+    }
+
+    report: Dict[str, List[Dict[str, Any]]] = {}
+    for provider_name, probe in probes.items():
+        pool = vault.pool(provider_name)
+        rows: List[Dict[str, Any]] = []
+        for api_key in pool.api_keys:
+            fingerprint = pool.fingerprint(api_key)
+            try:
+                probe(api_key)
+                rows.append({"fingerprint": fingerprint, "ok": True, "detail": "working"})
+            except ProviderHttpError as http_error:
+                rows.append(
+                    {
+                        "fingerprint": fingerprint,
+                        "ok": False,
+                        "detail": http_error.diagnosis(),
+                    }
+                )
+            except Exception as unexpected:  # noqa: BLE001
+                rows.append(
+                    {
+                        "fingerprint": fingerprint,
+                        "ok": False,
+                        "detail": "{0}: {1}".format(
+                            type(unexpected).__name__, str(unexpected)[:160]
+                        ),
+                    }
+                )
+        report[provider_name] = rows
+
+    return {"results": report, "usage": vault.export_usage()}
 
 
 @app.post("/api/models")
@@ -351,9 +445,10 @@ async def speak(request: Request) -> JSONResponse:
             speech_result = synthesize_speech_speechify(
                 vault,
                 text=block_text,
-                voice_identifier=voice_identifier or "alec",
-                model_identifier=request_body.get("speechify_model") or "simba-3.0",
+                voice_identifier=voice_identifier or "beatrice_32",
+                model_identifier=request_body.get("speechify_model") or "simba-3.2",
                 language=request_body.get("language"),
+                emotion=request_body.get("emotion"),
             )
         else:
             _require_providers(vault, ["openrouter"])

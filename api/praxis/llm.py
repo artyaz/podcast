@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from .keys import SecretVault
 from .transport import (
     ProviderHttpError,
+    bearer_header,
     get_json,
     post_for_bytes,
     post_json,
@@ -141,6 +142,47 @@ KOKORO_VOICES = [
     {"id": "bm_george", "label": "George", "accent": "British", "gender": "male"},
 ]
 
+SPEECHIFY_VOICES_URL = "https://api.sws.speechify.com/v1/voices"
+
+# Speechify's voice catalogue is model-dependent, and not as a subset. The bare
+# GET /v1/voices returns 50 voices of which only 5 are English, and none of them
+# are tagged simba-3.2; GET /v1/voices?model=simba-3.2 returns a different set of
+# 8 English voices that the bare call never mentions. Asking for a 3.2 voice from
+# the bare list therefore fails with "the selected voice is not available for
+# simba-3.2", which is why the model has to be part of the query.
+SPEECHIFY_MODELS = [
+    {
+        "id": "simba-3.2",
+        "label": "Simba 3.2 — streaming-native, emotional control",
+        "supports_emotion": True,
+        "languages": "English only",
+    },
+    {
+        "id": "simba-3.0",
+        "label": "Simba 3.0 — 50 voices, many languages",
+        "supports_emotion": False,
+        "languages": "Multilingual",
+    },
+    {
+        "id": "simba-english",
+        "label": "Simba English",
+        "supports_emotion": False,
+        "languages": "English",
+    },
+    {
+        "id": "simba-multilingual",
+        "label": "Simba Multilingual",
+        "supports_emotion": False,
+        "languages": "Multilingual",
+    },
+]
+
+# The five emotions Speechify documents for SSML control. Confirmed to produce
+# audibly different audio on simba-3.2. An undocumented value is NOT rejected —
+# "furious" returned a short clip rather than an error — so an invalid emotion
+# fails silently and the list must stay closed.
+SPEECHIFY_EMOTIONS = ["neutral", "calm", "cheerful", "energetic", "sad"]
+
 MAX_TOOL_ITERATIONS_DEFAULT = 14
 
 
@@ -162,6 +204,13 @@ def chat_completion(
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            # Sent explicitly because some OpenAI-compatible gateways stream by
+            # default. One was measured answering text/event-stream to a request
+            # that never mentioned streaming, which made the JSON parse fail at
+            # character 0 with "Expecting value". Asking for stream:false fixes it
+            # at the source; the transport layer can still fold a stream back
+            # together for gateways that ignore the flag.
+            "stream": False,
         }
         if include_reasoning and profile.reasoning:
             payload["reasoning"] = profile.reasoning
@@ -174,7 +223,7 @@ def chat_completion(
 
     def attempt(api_key: str):
         headers = {
-            "Authorization": "Bearer {0}".format(api_key),
+            "Authorization": bearer_header(api_key),
             "Content-Type": "application/json",
         }
         try:
@@ -220,7 +269,7 @@ def list_chat_models(vault: SecretVault, profile: Optional[LlmProfile] = None) -
     def attempt(api_key: str):
         response_body = get_json(
             profile.models_url,
-            headers={"Authorization": "Bearer {0}".format(api_key)},
+            headers={"Authorization": bearer_header(api_key)},
             timeout_seconds=30.0,
         )
         return response_body, {"dollars": 0.0}
@@ -234,18 +283,53 @@ def list_chat_models(vault: SecretVault, profile: Optional[LlmProfile] = None) -
     for raw_model in raw_models:
         if not isinstance(raw_model, dict) or not raw_model.get("id"):
             continue
+
+        # Two catalogue dialects seen in the wild. OpenRouter describes a model
+        # with `supported_parameters` plus a `reasoning` descriptor. Other
+        # OpenAI-compatible gateways use a `capabilities` object instead — one was
+        # measured returning {"tool_calling": true, "reasoning": true, ...} and no
+        # supported_parameters at all. Reading only the first dialect would report
+        # every model on such a gateway as having neither tools nor reasoning,
+        # which would steer you away from models that work perfectly well.
         supported_parameters = raw_model.get("supported_parameters") or []
+        capabilities = raw_model.get("capabilities") or {}
         pricing = raw_model.get("pricing") or {}
+
+        if supported_parameters:
+            supports_tools = "tools" in supported_parameters
+            supports_reasoning = "reasoning" in supported_parameters
+            supports_effort = "reasoning_effort" in supported_parameters
+            supports_include = "include_reasoning" in supported_parameters
+        elif capabilities:
+            supports_tools = bool(capabilities.get("tool_calling"))
+            supports_reasoning = bool(
+                capabilities.get("reasoning") or capabilities.get("thinking")
+            )
+            # This dialect says whether reasoning exists but not how it is asked
+            # for, so no effort list is claimed and the reasoning control falls
+            # back to a plain on/off.
+            supports_effort = False
+            supports_include = False
+        else:
+            # A bare /models listing gives only ids. Assume tools work rather than
+            # hiding every model: the research loop will fail loudly on the first
+            # call if they do not, which is more informative than an empty picker.
+            supports_tools = True
+            supports_reasoning = False
+            supports_effort = False
+            supports_include = False
+
         catalogue.append(
             {
                 "id": raw_model["id"],
                 "name": raw_model.get("name") or raw_model["id"],
-                "context_length": raw_model.get("context_length"),
+                "context_length": raw_model.get("context_length")
+                or raw_model.get("max_input_tokens"),
                 "prompt_price": pricing.get("prompt"),
-                "supports_tools": "tools" in supported_parameters,
-                "supports_reasoning": "reasoning" in supported_parameters,
-                "supports_reasoning_effort": "reasoning_effort" in supported_parameters,
-                "supports_include_reasoning": "include_reasoning" in supported_parameters,
+                "supports_tools": supports_tools,
+                "supports_reasoning": supports_reasoning,
+                "supports_reasoning_effort": supports_effort,
+                "supports_include_reasoning": supports_include,
                 "reasoning": raw_model.get("reasoning"),
             }
         )
@@ -286,14 +370,26 @@ def run_tool_loop(
             }
             return
 
-        response_body = chat_completion(
-            vault,
-            messages=messages,
-            profile=profile,
-            tools_enabled=True,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        try:
+            response_body = chat_completion(
+                vault,
+                messages=messages,
+                profile=profile,
+                tools_enabled=True,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except ProviderHttpError as call_failure:
+            # A gateway that cannot serve a tool call — one was measured answering
+            # 422 for tool requests and timing out on others — should not destroy
+            # the round. Stop the loop and let the caller write up whatever
+            # evidence was already gathered.
+            yield {
+                "type": "stopped_early",
+                "reason": call_failure.diagnosis(),
+                "messages": messages,
+            }
+            return
         choices = response_body.get("choices") or []
         if not choices:
             yield {"type": "error", "error": "model returned no choices", "messages": messages}
@@ -498,7 +594,7 @@ def transcribe_audio(
     def attempt(api_key: str):
         response_body = post_multipart_for_json(
             profile.transcribe_url,
-            headers={"Authorization": "Bearer {0}".format(api_key)},
+            headers={"Authorization": bearer_header(api_key)},
             files={"file": (filename, audio_bytes, content_type)},
             data={"model": profile.transcribe_model},
         )
@@ -521,7 +617,7 @@ def synthesize_speech_kokoro(
         audio_bytes, content_type = post_for_bytes(
             profile.speech_url,
             headers={
-                "Authorization": "Bearer {0}".format(api_key),
+                "Authorization": bearer_header(api_key),
                 "Content-Type": "application/json",
             },
             payload={
@@ -542,12 +638,30 @@ def synthesize_speech_kokoro(
     return run_with_rotation(vault.pool("openrouter"), attempt)
 
 
+def _wrap_with_emotion(text: str, emotion: Optional[str]) -> str:
+    """Wrap spoken text in Speechify's SSML emotion tag.
+
+    Only for emotions Speechify documents. An unrecognised value is accepted by
+    the API rather than rejected, so passing one through would silently change the
+    delivery in an unpredictable way instead of failing loudly.
+    """
+    if not emotion or emotion not in SPEECHIFY_EMOTIONS:
+        return text
+    escaped = (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    return '<speak><speechify:emotion emotion="{0}">{1}</speechify:emotion></speak>'.format(
+        emotion, escaped
+    )
+
+
 def synthesize_speech_speechify(
     vault: SecretVault,
     text: str,
-    voice_identifier: str = "alec",
-    model_identifier: str = "simba-3.0",
+    voice_identifier: str = "beatrice_32",
+    model_identifier: str = "simba-3.2",
     language: Optional[str] = None,
+    emotion: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Speechify returns base64 audio in a JSON envelope, plus timings.
 
@@ -559,7 +673,7 @@ def synthesize_speech_speechify(
 
     def attempt(api_key: str):
         request_payload: Dict[str, Any] = {
-            "input": text,
+            "input": _wrap_with_emotion(text, emotion),
             "voice_id": voice_identifier,
             "audio_format": "mp3",
             "model": model_identifier,
@@ -570,7 +684,7 @@ def synthesize_speech_speechify(
         response_body = post_json(
             SPEECHIFY_SPEECH_URL,
             headers={
-                "Authorization": "Bearer {0}".format(api_key),
+                "Authorization": bearer_header(api_key),
                 "Content-Type": "application/json",
             },
             payload=request_payload,
@@ -590,12 +704,25 @@ def synthesize_speech_speechify(
     return run_with_rotation(vault.pool("speechify"), attempt)
 
 
-def list_speechify_voices(vault: SecretVault) -> List[Dict[str, Any]]:
-    """Speechify does publish a voice list, unlike Kokoro."""
+def list_speechify_voices(
+    vault: SecretVault, model_name: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Speechify's voices for one model, or the default catalogue.
+
+    `model_name` does not filter a single list — it selects a different one. The
+    bare call returns 50 voices, of which only 5 are English and none are tagged
+    simba-3.2. Asking for simba-3.2 returns 8 English voices the bare call never
+    mentions, four of them British. Synthesis rejects any pairing the chosen model
+    does not list ("the selected voice is not available for simba-3.2"), so the
+    picker has to be built per model or the newest voices are invisible.
+    """
+    request_url = SPEECHIFY_VOICES_URL
+    if model_name:
+        request_url = "{0}?model={1}".format(SPEECHIFY_VOICES_URL, model_name)
+
     def attempt(api_key: str):
         response_body = get_json(
-            "https://api.sws.speechify.com/v1/voices",
-            headers={"Authorization": "Bearer {0}".format(api_key)},
+            request_url, headers={"Authorization": bearer_header(api_key)}
         )
         return response_body, {"dollars": 0.0}
 

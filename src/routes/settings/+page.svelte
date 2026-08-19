@@ -89,9 +89,43 @@
 	}
 
 	let kokoroVoices = $state<VoiceOption[]>([]);
-	let speechifyVoices = $state<VoiceOption[]>([]);
+	/** Speechify voices per model — each model has its own catalogue, not a filter. */
+	let speechifyByModel = $state<Record<string, VoiceOption[]>>({});
+	let speechifyModels = $state<{ id: string; label: string; supports_emotion?: boolean }[]>([]);
+	let speechifyEmotions = $state<string[]>([]);
 	let voicesMessage = $state('');
 	let loadingVoices = $state(false);
+
+	let keyReport = $state<Record<string, { fingerprint: string; ok: boolean; detail: string }[]>>({});
+	let checkingKeys = $state(false);
+	let keyCheckMessage = $state('');
+
+	/** Voices valid for the chosen Speechify model. */
+	const speechifyVoices = $derived(speechifyByModel[settings.speechifyModel] || []);
+
+	const chosenSpeechifyModel = $derived(
+		speechifyModels.find((entry) => entry.id === settings.speechifyModel)
+	);
+
+	async function checkKeys() {
+		checkingKeys = true;
+		keyCheckMessage = '';
+		try {
+			const response = await fetch(backendUrl('/api/keycheck'), {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ secrets: secretsPayload(), llm: llmPayload() })
+			});
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			const payload = await response.json();
+			keyReport = payload.results || {};
+			absorbUsage(payload.usage);
+		} catch (failure) {
+			keyCheckMessage = (failure as Error).message;
+		} finally {
+			checkingKeys = false;
+		}
+	}
 
 	let testMessage = $state('');
 	let testing = $state(false);
@@ -141,11 +175,25 @@
 			if (!response.ok) throw new Error(`HTTP ${response.status}`);
 			const payload = await response.json();
 			kokoroVoices = payload.kokoro || [];
-			speechifyVoices = payload.speechify || [];
+			speechifyByModel = payload.speechify_by_model || {};
+			speechifyModels = payload.speechify_models || [];
+			speechifyEmotions = payload.speechify_emotions || [];
 			absorbUsage(payload.usage);
+
+			// A voice from another model's catalogue is rejected at synthesis time, so
+			// adopt a valid one rather than leaving a stale id selected.
+			const validForModel = speechifyByModel[settings.speechifyModel] || [];
+			if (validForModel.length && !validForModel.some((v) => v.id === settings.speechifyVoice)) {
+				settings.speechifyVoice = validForModel[0].id;
+				save();
+			}
+
+			const perModel = Object.entries(speechifyByModel)
+				.map(([model, voices]) => `${model}: ${voices.length}`)
+				.join(', ');
 			voicesMessage = payload.speechify_error
-				? `Kokoro voices loaded. Speechify said: ${payload.speechify_error}`
-				: `${kokoroVoices.length} Kokoro voices, ${speechifyVoices.length} Speechify voices.`;
+				? `Kokoro loaded. Speechify said: ${payload.speechify_error}`
+				: `${kokoroVoices.length} Kokoro voices. Speechify — ${perModel}.`;
 		} catch (failure) {
 			voicesMessage = `Could not reach the backend: ${(failure as Error).message}`;
 		} finally {
@@ -505,7 +553,39 @@
 			</p>
 		{:else}
 			<label>
-				<span>Speechify voice</span>
+				<span>Speechify model</span>
+				<select
+					bind:value={settings.speechifyModel}
+					onchange={() => {
+						// Each model has its own voice catalogue, so the current voice may
+						// not exist here. Adopt a valid one instead of failing at playback.
+						const valid = speechifyByModel[settings.speechifyModel] || [];
+						if (valid.length && !valid.some((v) => v.id === settings.speechifyVoice)) {
+							settings.speechifyVoice = valid[0].id;
+						}
+						save();
+					}}
+				>
+					{#if speechifyModels.length}
+						{#each speechifyModels as model (model.id)}
+							<option value={model.id}>{model.label}</option>
+						{/each}
+					{:else}
+						<option value="simba-3.2">Simba 3.2 — streaming-native, emotional control</option>
+						<option value="simba-3.0">Simba 3.0 — 50 voices, many languages</option>
+						<option value="simba-english">Simba English</option>
+						<option value="simba-multilingual">Simba Multilingual</option>
+					{/if}
+				</select>
+			</label>
+
+			<label>
+				<span>
+					Speechify voice
+					{#if speechifyVoices.length}
+						— {speechifyVoices.length} available for this model
+					{/if}
+				</span>
 				<select bind:value={settings.speechifyVoice} onchange={save}>
 					{#if speechifyVoices.length}
 						{#each speechifyLocaleGroups as [locale, voices] (locale)}
@@ -516,20 +596,39 @@
 							</optgroup>
 						{/each}
 					{:else}
-						<option value="alec">Alec — en-GB male</option>
-						<option value="alicia">Alicia — en-US female</option>
+						<option value="beatrice_32">Beatrice — en-GB female</option>
+						<option value="edmund_32">Edmund — en-GB male</option>
+						<option value="hugh_32">Hugh — en-GB male</option>
+						<option value="imogen_32">Imogen — en-GB female</option>
+						<option value="dominic_32">Dominic — en-US male</option>
+						<option value="geffen_32">Geffen — en-US female</option>
+						<option value="harper_32">Harper — en-US female</option>
+						<option value="wyatt_32">Wyatt — en-US male</option>
 					{/if}
 				</select>
 			</label>
-			<label>
-				<span>Speechify model</span>
-				<select bind:value={settings.speechifyModel} onchange={save}>
-					<option value="simba-3.0">simba-3.0</option>
-					<option value="simba-english">simba-english</option>
-					<option value="simba-multilingual">simba-multilingual</option>
-				</select>
-			</label>
-			<p class="hint">Press “Load voices” to pull the live list, including non-English locales.</p>
+
+			{#if chosenSpeechifyModel?.supports_emotion}
+				<label>
+					<span>Delivery — shaped with SSML emotion control</span>
+					<select bind:value={settings.speechifyEmotion} onchange={save}>
+						{#each speechifyEmotions.length ? speechifyEmotions : ['neutral', 'calm', 'cheerful', 'energetic', 'sad'] as emotion (emotion)}
+							<option value={emotion}>{emotion}</option>
+						{/each}
+					</select>
+				</label>
+				<p class="hint">
+					Only Simba 3.2 honours emotion, and only these five values — an undocumented one is
+					accepted rather than rejected, so it would change the delivery unpredictably.
+				</p>
+			{/if}
+
+			<p class="hint">
+				Press “Load voices” — each Simba model has its own catalogue rather than a filtered view of
+				one list, and a voice from the wrong catalogue is rejected at playback. Simba 3.2 is a
+				curated set of eight English voices, four of them British; the older models list fifty
+				voices that are mostly non-English.
+			</p>
 		{/if}
 	</section>
 
@@ -577,8 +676,32 @@
 			<button class="ghost" onclick={testBackend} disabled={testing}>
 				{testing ? 'Testing…' : 'Test backend'}
 			</button>
+			<button class="ghost" onclick={checkKeys} disabled={checkingKeys}>
+				{checkingKeys ? 'Checking keys…' : 'Check every key'}
+			</button>
 		</div>
 		{#if testMessage}<p class="status" class:ok={testMessage.startsWith('✓')}>{testMessage}</p>{/if}
+		{#if keyCheckMessage}<p class="status">{keyCheckMessage}</p>{/if}
+
+		{#if Object.keys(keyReport).length}
+			<div class="usage">
+				{#each Object.entries(keyReport) as [provider, rows] (provider)}
+					{#each rows as row (row.fingerprint)}
+						<div class="usagerow">
+							<code>{provider} · {row.fingerprint}</code>
+							<span class:good={row.ok} class:bad={!row.ok}>
+								{row.ok ? 'working' : row.detail}
+							</span>
+						</div>
+					{/each}
+				{/each}
+			</div>
+			<p class="hint">
+				Rotation hides individual key failures on purpose — it moves to the next key and only
+				complains once nothing is left, which is right for a research run and useless for finding
+				out which key is wrong. This tests each one separately.
+			</p>
+		{/if}
 	</section>
 
 	<section>
@@ -718,6 +841,13 @@
 	}
 	.usagerow code {
 		font-size: 11.5px;
+	}
+	.usagerow .good {
+		color: var(--ok);
+	}
+	.usagerow .bad {
+		color: var(--bad);
+		text-align: right;
 	}
 	.currentmodel {
 		font-size: 12px;
