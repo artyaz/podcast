@@ -12,7 +12,8 @@ Everything below was established by calling the real endpoints, not by reading d
 
 | Capability | Endpoint | Notes |
 | --- | --- | --- |
-| Chat | `POST https://openrouter.ai/api/v1/chat/completions` | `~deepseek/deepseek-v4-flash-latest` is a real alias; it resolves to `deepseek/deepseek-v4-flash-0731`. Tool calling works, one call per turn. Reasoning is explicitly disabled. |
+| Chat | `POST {base_url}/chat/completions` | `~deepseek/deepseek-v4-flash-latest` is a real alias; it resolves to `deepseek/deepseek-v4-flash-0731`. Tool calling works, one call per turn. |
+| Model list | `GET {base_url}/models` | Carries the reasoning descriptor the settings screen is built from. |
 | Transcription | `POST https://openrouter.ai/api/v1/audio/transcriptions` | Multipart. `openai/whisper-large-v3-turbo` **rejects** `/chat/completions` with an HTTP 400 telling you to come here. |
 | Speech (Kokoro) | `POST https://openrouter.ai/api/v1/audio/speech` | Takes `input`, not `messages`. Returns raw MP3 bytes. |
 | Speech (Speechify) | `POST https://api.sws.speechify.com/v1/audio/speech` | Returns base64 in a JSON envelope, plus `speech_marks` timings and `billable_characters_count`. |
@@ -38,6 +39,61 @@ The full enum is `neural | keyword | auto | hybrid | fast | blue | deep-reasonin
 
 The model picks the mode per query and is told these numbers, so it can spend deliberately: cheap modes to confirm a date, `deep-reasoning` when sources are known to disagree.
 
+### Reasoning, and why the control is built from model metadata
+
+Each model's entry in the catalogue carries a `reasoning` descriptor, and it is
+the only honest basis for a reasoning setting. Guessing gets punished:
+
+| Model | Descriptor | Consequence |
+| --- | --- | --- |
+| `deepseek/deepseek-v4-flash` | `mandatory: false, default_enabled: true, supported_efforts: [max, high, low]` | Reasoning is **on** unless explicitly disabled, and there is no `medium` |
+| `deepseek/deepseek-r1` | `mandatory: true` | `{"enabled": false}` returns **HTTP 400 "Reasoning is mandatory"** |
+| `openai/gpt-5` | `mandatory: true, supported_efforts: [high, medium, low, minimal]` | Cannot be turned off; four effort levels |
+| `deepseek/deepseek-chat` | `null` | No reasoning at all; the parameter is ignored |
+
+So the settings screen hides the control entirely for a model with no reasoning,
+hides the Off switch for a model that requires it, and populates the effort list
+from that model's own `supported_efforts` rather than a fixed low/medium/high.
+Switching models re-validates the saved choice, because carrying `medium` from
+gpt-5 over to deepseek-v4-flash would send a value that model never advertised —
+which is not rejected, just silently reinterpreted.
+
+Two measured details shape the rest. `exclude: true` stops the reasoning text
+coming back but **not** the thinking: a call with `effort: low, exclude: true`
+returned zero trace characters and still billed 13 reasoning tokens. And
+reasoning tokens are spent from the same `max_tokens` pool as the answer, which
+truncated a JSON scoping response at 1460 characters that completed cleanly with
+reasoning off — so the profile adds a reasoning allowance on top of the requested
+ceiling.
+
+Because the endpoint is configurable, all four paths — chat, transcription,
+speech, and the model list — are read from one base URL. OpenRouter is the
+default; any OpenAI-compatible server works, and one that implements only chat
+still works with a degraded model picker.
+
+### Breaking a subject into segments
+
+`POST /api/outline` divides a subject into an even spine of segments before any
+research happens: one cheap call, no tools, and the result is the listener's to
+accept, prune, or regenerate. Accepting it changes the run in two places —
+scoping is told the segments are fixed and must distribute its open questions
+across them, and the writing step is told to cover them in order with comparable
+weight. The spine travels in the checkpoint, so it survives every resume.
+
+It is worth using when a subject is broad enough that a single scoping pass would
+skim it. A narrow question does not need it.
+
+### Structured output is validated, not trusted
+
+This model returns syntactically perfect JSON with the right keys and nothing in
+them. A scoping call was observed returning an empty governing axis and an empty
+question list; the graph accepted it and carried the emptiness forward as though
+the question had been scoped. So every structured call now declares which keys
+must be present and which must be non-empty, and a response failing either is
+retried rather than returned. Truncated responses are never salvaged by slicing
+between braces — a partial object that happens to parse is worse than a parse
+error, because the caller believes it.
+
 ---
 
 ## Architecture
@@ -47,7 +103,7 @@ The model picks the mode per query and is told these numbers, so it can spend de
   src/lib/settings.svelte.ts   keys, rotation counters, voices — localStorage only
   src/lib/lesson.svelte.ts     blocks, the resume loop, inline asks
   src/lib/audio.svelte.ts      per-block synthesis, cache, sequential playback
-  src/lib/components/          BlockView, BlockActions, AskBar
+  src/lib/components/          BlockView, BlockActions, AskBar, SubtopicModal
 /api                   FastAPI + LangGraph on the Vercel Python runtime
   praxis/keys.py         multi-key pools, quota-aware ordering
   praxis/transport.py    HTTP plus the rotation retry loop
@@ -122,7 +178,7 @@ Set `PRAXIS_BACKEND_URL` if the backend is not on `http://127.0.0.1:8000`.
 
 None are shipped. Every key is entered in Settings, stored in this browser's `localStorage`, and sent with each request. Add several per provider to get rotation.
 
-- **OpenRouter** — required. Model, transcription, and Kokoro speech.
+- **OpenRouter** (or any OpenAI-compatible endpoint) — required. Model, transcription, and Kokoro speech.
 - **Exa** — required. Search.
 - **Firecrawl** — optional but strongly recommended. Without it the agent can only read search snippets, never a full statute or paper, and snippets strip exactly the qualifications the argument lives in.
 - **Speechify** — optional. Better voices and word-level timings.

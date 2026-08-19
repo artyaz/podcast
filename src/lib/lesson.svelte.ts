@@ -1,4 +1,4 @@
-import { absorbUsage, backendUrl, secretsPayload, settings } from './settings.svelte';
+import { absorbUsage, backendUrl, llmPayload, secretsPayload, settings } from './settings.svelte';
 
 /**
  * The lesson document and the two loops that fill it.
@@ -42,6 +42,8 @@ export interface ResearchActivity {
 
 interface LessonState {
 	topic: string;
+	/** The chosen episode spine, empty when the topic was researched freely. */
+	subtopics: { title: string; angle?: string }[];
 	blocks: Block[];
 	/** The backend's research checkpoint. Kept so an inline ask can reuse findings. */
 	researchState: Record<string, unknown> | null;
@@ -55,6 +57,7 @@ interface LessonState {
 
 export const lesson = $state<LessonState>({
 	topic: '',
+	subtopics: [],
 	blocks: [],
 	researchState: null,
 	running: false,
@@ -180,8 +183,12 @@ function absorbResearchEvent(event: Record<string, unknown>): void {
 /**
  * Research a topic into a lesson, resuming across as many invocations as it takes.
  */
-export async function runResearch(topic: string): Promise<void> {
+export async function runResearch(
+	topic: string,
+	subtopics: { title: string; angle?: string }[] = []
+): Promise<void> {
 	lesson.topic = topic;
+	lesson.subtopics = subtopics;
 	lesson.blocks = [];
 	lesson.researchState = null;
 	lesson.running = true;
@@ -200,7 +207,10 @@ export async function runResearch(topic: string): Promise<void> {
 				topic: carriedState ? undefined : topic,
 				state: carriedState ?? undefined,
 				secrets: secretsPayload(),
-				model: settings.model,
+				llm: llmPayload(),
+				// Only sent on the opening request; afterwards the spine lives in the
+				// checkpoint and resending it would fight the carried state.
+				subtopics: carriedState ? undefined : subtopics,
 				budget_seconds: settings.budgetSeconds,
 				minimum_rounds: settings.minimumRounds,
 				maximum_rounds: settings.maximumRounds,
@@ -302,7 +312,7 @@ export async function askAt(afterBlockId: string | null, questionText: string): 
 			context: contextAround(insertAtIndex),
 			findings: (lesson.researchState?.findings as unknown[]) || [],
 			secrets: secretsPayload(),
-			model: settings.model,
+			llm: llmPayload(),
 			budget_seconds: Math.min(settings.budgetSeconds, 150)
 		});
 

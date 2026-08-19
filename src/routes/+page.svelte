@@ -2,11 +2,13 @@
 	import AskBar from '$lib/components/AskBar.svelte';
 	import BlockActions from '$lib/components/BlockActions.svelte';
 	import BlockView from '$lib/components/BlockView.svelte';
+	import SubtopicModal from '$lib/components/SubtopicModal.svelte';
 	import { playFrom, playback, stopPlayback } from '$lib/audio.svelte';
 	import { lesson, runResearch, type Block } from '$lib/lesson.svelte';
 	import { canResearch, settings } from '$lib/settings.svelte';
 
 	let topicDraft = $state('');
+	let showSubtopicModal = $state(false);
 	let sheetBlock = $state<Block | null>(null);
 	let anchorBlockId = $state<string | null>(null);
 	let showActivity = $state(true);
@@ -18,6 +20,13 @@
 		const topic = topicDraft.trim();
 		if (!topic) return;
 		runResearch(topic);
+	}
+
+	function beginWithSegments(subtopics: { title: string; angle?: string }[]) {
+		const topic = topicDraft.trim();
+		showSubtopicModal = false;
+		if (!topic || !subtopics.length) return;
+		runResearch(topic, subtopics);
 	}
 </script>
 
@@ -41,9 +50,24 @@
 		></textarea>
 
 		{#if canResearch()}
-			<button class="primary" onclick={begin} disabled={!topicDraft.trim()}>
-				Research and write it
-			</button>
+			<div class="startrow">
+				<button class="primary" onclick={begin} disabled={!topicDraft.trim()}>
+					Research and write it
+				</button>
+				<button
+					class="ghost"
+					onclick={() => (showSubtopicModal = true)}
+					disabled={!topicDraft.trim()}
+					title="Split the subject into evenly divided segments first"
+				>
+					Break into segments
+				</button>
+			</div>
+			<p class="lede small">
+				Breaking it up first divides the subject into segments, spreads the research evenly across
+				them, and makes the episode follow them in order. Useful when a subject is broad enough that
+				one pass would skim it.
+			</p>
 		{:else}
 			<p class="warn">
 				Add an OpenRouter key and an Exa key in <a href="/settings">Settings</a> first. Nothing is
@@ -51,9 +75,25 @@
 			</p>
 		{/if}
 	</div>
+
+	{#if showSubtopicModal}
+		<SubtopicModal
+			topic={topicDraft.trim()}
+			onClose={() => (showSubtopicModal = false)}
+			onProceed={beginWithSegments}
+		/>
+	{/if}
 {:else}
 	<div class="lesson" class:hasbar={lesson.blocks.length > 0}>
 		<h1 class="topic">{lesson.topic}</h1>
+
+		{#if lesson.subtopics.length}
+			<ol class="spine">
+				{#each lesson.subtopics as segment, segmentIndex (segment.title + segmentIndex)}
+					<li>{segment.title}</li>
+				{/each}
+			</ol>
+		{/if}
 
 		{#if lesson.running || lesson.errorMessage}
 			<div class="rail">
@@ -162,6 +202,11 @@
 	textarea:focus {
 		border-color: color-mix(in srgb, var(--ink) 45%, var(--line));
 	}
+	.startrow {
+		display: flex;
+		gap: 9px;
+		flex-wrap: wrap;
+	}
 	.primary {
 		padding: 14px 24px;
 		border-radius: 13px;
@@ -171,6 +216,10 @@
 	}
 	.primary:disabled {
 		opacity: 0.4;
+	}
+	.lede.small {
+		font-size: 13px;
+		margin-top: -6px;
 	}
 	.warn {
 		margin: 0;
@@ -193,6 +242,19 @@
 		margin: 0 0 20px;
 	}
 
+	.spine {
+		list-style: decimal;
+		margin: -8px 0 22px;
+		padding-left: 20px;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.spine li {
+		font-size: 13px;
+		color: var(--muted);
+		line-height: 1.45;
+	}
 	.rail {
 		border: 1px solid var(--line);
 		border-radius: 12px;

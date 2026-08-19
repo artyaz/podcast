@@ -13,6 +13,25 @@ export type ProviderName = 'openrouter' | 'exa' | 'firecrawl' | 'speechify';
 
 export const PROVIDER_NAMES: ProviderName[] = ['openrouter', 'exa', 'firecrawl', 'speechify'];
 
+/** What an endpoint reports about one model's reasoning support. */
+export interface ModelCapability {
+	id: string;
+	name?: string;
+	context_length?: number | null;
+	prompt_price?: string | null;
+	supports_tools?: boolean;
+	supports_reasoning?: boolean;
+	supports_reasoning_effort?: boolean;
+	supports_include_reasoning?: boolean;
+	reasoning?: {
+		mandatory?: boolean;
+		default_enabled?: boolean;
+		default_effort?: string;
+		supported_efforts?: string[];
+		supports_max_tokens?: boolean;
+	} | null;
+}
+
 export interface KeyUsageRecord {
 	spent_dollars?: number;
 	calls?: number;
@@ -26,8 +45,39 @@ export interface Settings {
 	/** Per-key counters returned by the backend, addressed by key fingerprint. */
 	usage: Record<ProviderName, Record<string, KeyUsageRecord>>;
 
-	/** Chat model on OpenRouter. Non-reasoning variant by default. */
+	/** Which kind of endpoint serves the model. */
+	llmProvider: 'openrouter' | 'openai_compatible';
+	/** Base URL of that endpoint, without a trailing slash. */
+	llmBaseUrl: string;
+	/** Chat model id, chosen from the endpoint's own catalogue. */
 	model: string;
+	/** Whisper-compatible transcription model on the same endpoint. */
+	transcribeModel: string;
+	/** Kokoro speech model on the same endpoint. */
+	kokoroModel: string;
+
+	/**
+	 * What the chosen model says about its own reasoning, cached from the model
+	 * list so the reasoning payload stays correct across reloads without
+	 * refetching 400-odd models.
+	 *
+	 * This is the whole basis of the reasoning control. `mandatory` decides
+	 * whether an off switch is even legal — turning reasoning off on a mandatory
+	 * model is an HTTP 400, not a no-op. `supported_efforts` is the exact set of
+	 * accepted values and it differs per model: deepseek-v4-flash takes
+	 * max/high/low with no medium, gpt-5 takes high/medium/low/minimal.
+	 */
+	modelCapability: ModelCapability | null;
+
+	/** How reasoning is requested. Constrained by modelCapability. */
+	reasoningMode: 'off' | 'effort' | 'tokens';
+	reasoningEffort: string;
+	reasoningMaxTokens: number;
+	/** Hide the reasoning trace in responses. Note: the tokens are still billed. */
+	excludeReasoningTrace: boolean;
+
+	/** Default number of segments offered when breaking a subject up. */
+	subtopicCount: number;
 
 	/** Speech: which provider reads the lesson aloud, and in which voice. */
 	speechProvider: 'kokoro' | 'speechify';
@@ -60,7 +110,17 @@ const STORAGE_KEY = 'praxis.settings';
 const emptySettings: Settings = {
 	keys: { openrouter: [], exa: [], firecrawl: [], speechify: [] },
 	usage: { openrouter: {}, exa: {}, firecrawl: {}, speechify: {} },
+	llmProvider: 'openrouter',
+	llmBaseUrl: 'https://openrouter.ai/api/v1',
 	model: '~deepseek/deepseek-v4-flash-latest',
+	transcribeModel: 'openai/whisper-large-v3-turbo',
+	kokoroModel: 'hexgrad/kokoro-82m',
+	modelCapability: null,
+	reasoningMode: 'off',
+	reasoningEffort: '',
+	reasoningMaxTokens: 2000,
+	excludeReasoningTrace: true,
+	subtopicCount: 5,
 	speechProvider: 'kokoro',
 	kokoroVoice: 'af_heart',
 	speechifyVoice: 'alec',
@@ -136,6 +196,116 @@ export function absorbUsage(returnedUsage: unknown) {
 			settings.usage[provider] = providerUsage as Record<string, KeyUsageRecord>;
 		}
 	}
+	save();
+}
+
+/**
+ * The reasoning parameter for the chosen model, or null to send none.
+ *
+ * Built from the model's own descriptor rather than from a fixed list, because
+ * the wrong shape is not ignored: disabling reasoning on a model that reports
+ * `mandatory: true` returns HTTP 400, and an effort value the model never
+ * advertised is silently coerced to something unpredictable.
+ */
+export function reasoningPayload(): Record<string, unknown> | null {
+	const capability = settings.modelCapability;
+
+	// Unknown model, or one with no reasoning at all: send nothing and let the
+	// endpoint do whatever it does by default.
+	if (!capability || !capability.supports_reasoning) return null;
+
+	const descriptor = capability.reasoning || {};
+	const isMandatory = descriptor.mandatory === true;
+	const efforts = descriptor.supported_efforts || [];
+
+	if (settings.reasoningMode === 'off') {
+		// An off switch on a mandatory model is an error, so fall back to the
+		// model's own default effort — the cheapest honest thing available.
+		if (!isMandatory) return { enabled: false };
+		if (efforts.length) {
+			return {
+				effort: descriptor.default_effort || efforts[efforts.length - 1],
+				exclude: settings.excludeReasoningTrace
+			};
+		}
+		return null;
+	}
+
+	if (settings.reasoningMode === 'tokens') {
+		return {
+			max_tokens: Math.max(256, Math.round(settings.reasoningMaxTokens) || 2000),
+			exclude: settings.excludeReasoningTrace
+		};
+	}
+
+	const chosenEffort =
+		settings.reasoningEffort && efforts.includes(settings.reasoningEffort)
+			? settings.reasoningEffort
+			: descriptor.default_effort || efforts[0];
+	if (!chosenEffort) return { enabled: true };
+	return { effort: chosenEffort, exclude: settings.excludeReasoningTrace };
+}
+
+/** Endpoint, models, and reasoning setting, sent with every backend request. */
+export function llmPayload() {
+	return {
+		base_url: settings.llmBaseUrl,
+		model: settings.model,
+		transcribe_model: settings.transcribeModel,
+		speech_model: settings.kokoroModel,
+		reasoning: reasoningPayload()
+	};
+}
+
+/** Effort values this model actually accepts, for the selector. */
+export function availableEfforts(): string[] {
+	return settings.modelCapability?.reasoning?.supported_efforts || [];
+}
+
+export function reasoningIsMandatory(): boolean {
+	return settings.modelCapability?.reasoning?.mandatory === true;
+}
+
+export function modelHasReasoning(): boolean {
+	return settings.modelCapability?.supports_reasoning === true;
+}
+
+export function modelSupportsTokenBudget(): boolean {
+	return settings.modelCapability?.reasoning?.supports_max_tokens === true;
+}
+
+/**
+ * Adopt a model and reset any reasoning choice the new model cannot honour.
+ * Without this, switching from gpt-5 (medium) to deepseek-v4-flash (max/high/low)
+ * would leave "medium" selected and send a value that model never advertised.
+ */
+export function selectModel(capability: ModelCapability) {
+	settings.model = capability.id;
+	settings.modelCapability = capability;
+
+	const descriptor = capability.reasoning || {};
+	const efforts = descriptor.supported_efforts || [];
+
+	if (!capability.supports_reasoning) {
+		settings.reasoningMode = 'off';
+	} else if (descriptor.mandatory === true && settings.reasoningMode === 'off') {
+		settings.reasoningMode = efforts.length ? 'effort' : 'tokens';
+	}
+	if (!efforts.includes(settings.reasoningEffort)) {
+		settings.reasoningEffort = descriptor.default_effort || efforts[0] || '';
+	}
+	if (settings.reasoningMode === 'tokens' && descriptor.supports_max_tokens !== true) {
+		settings.reasoningMode = efforts.length ? 'effort' : 'off';
+	}
+	save();
+}
+
+/** Switching endpoint kind resets the catalogue-derived state. */
+export function selectLlmProvider(provider: 'openrouter' | 'openai_compatible') {
+	settings.llmProvider = provider;
+	if (provider === 'openrouter') settings.llmBaseUrl = 'https://openrouter.ai/api/v1';
+	// The previous endpoint's model and its capabilities mean nothing here.
+	settings.modelCapability = null;
 	save();
 }
 

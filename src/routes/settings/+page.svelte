@@ -2,17 +2,82 @@
 	import {
 		PROVIDER_NAMES,
 		absorbUsage,
+		availableEfforts,
 		backendUrl,
 		exportConfig,
 		fingerprintOf,
 		importConfig,
 		keysAsText,
+		llmPayload,
+		modelHasReasoning,
+		modelSupportsTokenBudget,
+		reasoningIsMandatory,
+		reasoningPayload,
 		save,
 		secretsPayload,
+		selectLlmProvider,
+		selectModel,
 		setKeysFromText,
 		settings,
+		type ModelCapability,
 		type ProviderName
 	} from '$lib/settings.svelte';
+
+	let modelCatalogue = $state<ModelCapability[]>([]);
+	let modelQuery = $state('');
+	let modelsMessage = $state('');
+	let loadingModels = $state(false);
+
+	/**
+	 * Search across name and id so both "gemini flash" and "google/" find things,
+	 * and every whitespace-separated word has to match somewhere — typing
+	 * "deepseek flash" should narrow rather than widen.
+	 */
+	const visibleModels = $derived.by(() => {
+		const words = modelQuery.toLowerCase().split(/\s+/).filter(Boolean);
+		const matches = modelCatalogue.filter((candidate) => {
+			if (!words.length) return true;
+			const haystack = `${candidate.id} ${candidate.name ?? ''}`.toLowerCase();
+			return words.every((word) => haystack.includes(word));
+		});
+		// The list is 400-plus entries; rendering all of them makes the page crawl.
+		return matches.slice(0, 40);
+	});
+
+	async function loadModels() {
+		loadingModels = true;
+		modelsMessage = '';
+		try {
+			const response = await fetch(backendUrl('/api/models'), {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ secrets: secretsPayload(), llm: llmPayload() })
+			});
+			if (!response.ok) {
+				let detail = `HTTP ${response.status}`;
+				try {
+					detail = (await response.json()).detail || detail;
+				} catch {
+					/* keep the status line */
+				}
+				throw new Error(detail);
+			}
+			const payload = await response.json();
+			modelCatalogue = payload.models || [];
+			absorbUsage(payload.usage);
+			modelsMessage = `${modelCatalogue.length} models available.`;
+
+			// Re-adopt the saved model so its capabilities are refreshed. Without this
+			// a model chosen before this catalogue existed keeps a null descriptor and
+			// the reasoning control has nothing to work from.
+			const current = modelCatalogue.find((candidate) => candidate.id === settings.model);
+			if (current) selectModel(current);
+		} catch (failure) {
+			modelsMessage = `Could not read the model list: ${(failure as Error).message}`;
+		} finally {
+			loadingModels = false;
+		}
+	}
 
 	interface VoiceOption {
 		id: string;
@@ -175,20 +240,212 @@
 	{/each}
 
 	<section>
+		<h2>Endpoint</h2>
+		<div class="row">
+			<button
+				class="ghost"
+				class:on={settings.llmProvider === 'openrouter'}
+				onclick={() => {
+					selectLlmProvider('openrouter');
+					modelCatalogue = [];
+				}}
+			>
+				OpenRouter
+			</button>
+			<button
+				class="ghost"
+				class:on={settings.llmProvider === 'openai_compatible'}
+				onclick={() => {
+					selectLlmProvider('openai_compatible');
+					modelCatalogue = [];
+				}}
+			>
+				OpenAI-compatible
+			</button>
+		</div>
+
+		{#if settings.llmProvider === 'openai_compatible'}
+			<label>
+				<span>Base URL — the part before /chat/completions</span>
+				<input
+					bind:value={settings.llmBaseUrl}
+					onchange={save}
+					placeholder="https://api.openai.com/v1"
+					autocapitalize="none"
+					autocorrect="off"
+					spellcheck="false"
+				/>
+			</label>
+			<p class="hint">
+				Chat, transcription, speech, and the model list are all read from this base. A server that
+				only implements chat still works — the model picker just falls back to a plain list, and
+				transcription or speech will fail if that server does not serve those paths.
+			</p>
+		{/if}
+	</section>
+
+	<section>
 		<h2>Model</h2>
-		<label>
-			<span>Chat model on OpenRouter</span>
+		<div class="row">
+			<button class="ghost" onclick={loadModels} disabled={loadingModels}>
+				{loadingModels ? 'Loading…' : 'Load models'}
+			</button>
+			<span class="currentmodel">{settings.model || 'none selected'}</span>
+		</div>
+		{#if modelsMessage}<p class="status">{modelsMessage}</p>{/if}
+
+		{#if modelCatalogue.length}
 			<input
-				bind:value={settings.model}
-				onchange={save}
+				bind:value={modelQuery}
+				placeholder="Search {modelCatalogue.length} models — name, vendor, id"
 				autocapitalize="none"
 				autocorrect="off"
 				spellcheck="false"
 			/>
-		</label>
+			<div class="results">
+				{#each visibleModels as candidate (candidate.id)}
+					<button
+						class="modelrow"
+						class:chosen={candidate.id === settings.model}
+						onclick={() => {
+							selectModel(candidate);
+							modelQuery = '';
+						}}
+					>
+						<span class="modelname">{candidate.name || candidate.id}</span>
+						<span class="modelmeta">
+							{candidate.id}
+							{#if !candidate.supports_tools}· no tools{/if}
+							{#if candidate.reasoning?.mandatory}· reasoning forced{/if}
+							{#if candidate.supports_reasoning && !candidate.reasoning?.mandatory}· reasoning optional{/if}
+							{#if !candidate.supports_reasoning}· no reasoning{/if}
+						</span>
+					</button>
+				{/each}
+				{#if !visibleModels.length}
+					<p class="hint">Nothing matches “{modelQuery}”.</p>
+				{/if}
+			</div>
+			<p class="hint">
+				A model without tool support cannot research anything — the whole loop is tool calls — so
+				those are marked and best avoided.
+			</p>
+		{/if}
+	</section>
+
+	<section>
+		<h2>Reasoning</h2>
+		{#if !settings.modelCapability}
+			<p class="hint">
+				Load the models and pick one. The reasoning options are built from what that specific model
+				reports about itself, because the wrong shape is not ignored: turning reasoning off on a
+				model that requires it returns an error, and an effort value the model never advertised gets
+				silently reinterpreted.
+			</p>
+		{:else if !modelHasReasoning()}
+			<p class="hint">
+				This model has no reasoning mode, so there is nothing to configure. No reasoning parameter
+				is sent.
+			</p>
+		{:else}
+			<div class="row">
+				{#if !reasoningIsMandatory()}
+					<button
+						class="ghost"
+						class:on={settings.reasoningMode === 'off'}
+						onclick={() => {
+							settings.reasoningMode = 'off';
+							save();
+						}}
+					>
+						Off
+					</button>
+				{/if}
+				{#if availableEfforts().length}
+					<button
+						class="ghost"
+						class:on={settings.reasoningMode === 'effort'}
+						onclick={() => {
+							settings.reasoningMode = 'effort';
+							save();
+						}}
+					>
+						Effort
+					</button>
+				{/if}
+				{#if modelSupportsTokenBudget()}
+					<button
+						class="ghost"
+						class:on={settings.reasoningMode === 'tokens'}
+						onclick={() => {
+							settings.reasoningMode = 'tokens';
+							save();
+						}}
+					>
+						Token budget
+					</button>
+				{/if}
+			</div>
+
+			{#if reasoningIsMandatory()}
+				<p class="hint">
+					This model cannot have reasoning switched off — asking for that is rejected outright — so
+					there is no Off option.
+				</p>
+			{/if}
+
+			{#if settings.reasoningMode === 'effort' && availableEfforts().length}
+				<label>
+					<span>Effort — only the values this model actually accepts</span>
+					<select bind:value={settings.reasoningEffort} onchange={save}>
+						{#each availableEfforts() as effort (effort)}
+							<option value={effort}>
+								{effort}{settings.modelCapability.reasoning?.default_effort === effort
+									? ' (model default)'
+									: ''}
+							</option>
+						{/each}
+					</select>
+				</label>
+			{/if}
+
+			{#if settings.reasoningMode === 'tokens'}
+				<label>
+					<span>Reasoning token budget</span>
+					<input
+						type="number"
+						min="256"
+						max="32000"
+						bind:value={settings.reasoningMaxTokens}
+						onchange={save}
+					/>
+				</label>
+			{/if}
+
+			{#if settings.reasoningMode !== 'off' && settings.modelCapability.supports_include_reasoning}
+				<label class="checkline">
+					<input
+						type="checkbox"
+						bind:checked={settings.excludeReasoningTrace}
+						onchange={save}
+					/>
+					<span>
+						Hide the reasoning trace in responses. Worth knowing: this only stops the text coming
+						back, it does not stop the thinking — the reasoning tokens are still generated and
+						still billed.
+					</span>
+				</label>
+			{/if}
+
+			<p class="hint">
+				Research quality here comes from searching and reading, not from thinking harder in one
+				turn, so Off is a reasonable default and keeps passes inside the time limit. Raise it when a
+				subject is genuinely tangled.
+			</p>
+		{/if}
+
 		<p class="hint">
-			The default is the non-reasoning DeepSeek v4 Flash alias, which resolves to a dated build and
-			runs with reasoning explicitly switched off.
+			Sent to the endpoint as: <code>{JSON.stringify(reasoningPayload())}</code>
 		</p>
 	</section>
 
@@ -461,5 +718,56 @@
 	}
 	.usagerow code {
 		font-size: 11.5px;
+	}
+	.currentmodel {
+		font-size: 12px;
+		color: var(--muted);
+		align-self: center;
+		word-break: break-all;
+	}
+	.results {
+		display: flex;
+		flex-direction: column;
+		border: 1.5px solid var(--line);
+		border-radius: 13px;
+		overflow: hidden;
+		max-height: 320px;
+		overflow-y: auto;
+	}
+	.modelrow {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+		text-align: left;
+		padding: 11px 14px;
+		border-bottom: 1px solid var(--line);
+	}
+	.modelrow:last-child {
+		border-bottom: none;
+	}
+	.modelrow.chosen {
+		background: color-mix(in srgb, var(--ink) 7%, transparent);
+	}
+	.modelname {
+		font-size: 15px;
+	}
+	.modelmeta {
+		font-size: 11.5px;
+		color: var(--muted);
+		word-break: break-all;
+	}
+	.checkline {
+		flex-direction: row;
+		align-items: flex-start;
+		gap: 10px;
+	}
+	.checkline input {
+		width: auto;
+		margin-top: 3px;
+		flex: 0 0 auto;
+	}
+	code {
+		font-size: 11.5px;
+		word-break: break-all;
 	}
 </style>

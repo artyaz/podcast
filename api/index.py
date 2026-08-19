@@ -26,12 +26,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from praxis.graph import (
     answer_inline_question,
     new_research_state,
+    propose_subtopics,
     run_research_slice,
 )
 from praxis.keys import KeyExhausted, SecretVault
 from praxis.llm import (
     DEFAULT_CHAT_MODEL,
     KOKORO_VOICES,
+    LlmProfile,
+    list_chat_models,
     list_speechify_voices,
     synthesize_speech_kokoro,
     synthesize_speech_speechify,
@@ -64,6 +67,15 @@ def _server_sent_event(event_payload: Dict[str, Any]) -> str:
 
 def _build_vault(request_body: Dict[str, Any]) -> SecretVault:
     return SecretVault(request_body.get("secrets") or {})
+
+
+def _build_profile(request_body: Dict[str, Any]) -> LlmProfile:
+    """Endpoint, model, and reasoning setting for this request.
+
+    The browser sends this because the browser is what holds the model catalogue
+    and therefore knows which reasoning shape the chosen model actually accepts.
+    """
+    return LlmProfile.from_payload(request_body.get("llm"))
 
 
 def _require_providers(vault: SecretVault, required: List[str]) -> None:
@@ -123,6 +135,71 @@ async def voices(request: Request) -> Dict[str, Any]:
     }
 
 
+@app.post("/api/models")
+async def models(request: Request) -> Dict[str, Any]:
+    """The configured endpoint's model catalogue, for the searchable picker.
+
+    Proxied rather than fetched from the browser because the key must not be
+    exposed to a cross-origin request and many OpenAI-compatible servers send no
+    CORS headers at all.
+    """
+    request_body = await request.json()
+    vault = _build_vault(request_body)
+    _require_providers(vault, ["openrouter"])
+
+    try:
+        catalogue = list_chat_models(vault, _build_profile(request_body))
+    except KeyExhausted as exhausted:
+        raise HTTPException(status_code=402, detail=str(exhausted))
+    except Exception as failure:  # noqa: BLE001 - surfaced to the settings screen
+        raise HTTPException(
+            status_code=502,
+            detail="Could not read the model list: {0}".format(str(failure)),
+        )
+
+    return {"models": catalogue, "count": len(catalogue), "usage": vault.export_usage()}
+
+
+@app.post("/api/outline")
+async def outline(request: Request) -> Dict[str, Any]:
+    """Split a subject into an even spine of segments, before research starts.
+
+    Cheap and synchronous: it is one model call with no tools, and the listener is
+    looking at a modal waiting to accept or reject the result.
+    """
+    request_body = await request.json()
+    vault = _build_vault(request_body)
+    _require_providers(vault, ["openrouter"])
+
+    topic = (request_body.get("topic") or "").strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="Provide a topic to break up.")
+
+    try:
+        subtopics = propose_subtopics(
+            vault,
+            topic=topic,
+            subtopic_count=int(request_body.get("subtopic_count") or 5),
+            profile=_build_profile(request_body),
+        )
+    except KeyExhausted as exhausted:
+        raise HTTPException(status_code=402, detail=str(exhausted))
+    except ValueError as parse_failure:
+        raise HTTPException(
+            status_code=502,
+            detail="The model did not return a usable outline: {0}".format(
+                str(parse_failure)
+            ),
+        )
+
+    if not subtopics:
+        raise HTTPException(
+            status_code=502, detail="The model returned no subtopics for that subject."
+        )
+
+    return {"subtopics": subtopics, "usage": vault.export_usage()}
+
+
 @app.post("/api/research")
 async def research(request: Request) -> StreamingResponse:
     """Advance a lesson's research by one slice, streaming progress.
@@ -145,10 +222,11 @@ async def research(request: Request) -> StreamingResponse:
             target_block_count=int(request_body.get("target_block_count") or 12),
             minimum_rounds=int(request_body.get("minimum_rounds") or 2),
             maximum_rounds=int(request_body.get("maximum_rounds") or 5),
+            subtopics=request_body.get("subtopics") or None,
         )
 
     budget_seconds = _clamped_budget(request_body.get("budget_seconds"))
-    model_identifier = request_body.get("model") or DEFAULT_CHAT_MODEL
+    profile = _build_profile(request_body)
 
     def event_stream() -> Iterator[str]:
         try:
@@ -156,7 +234,7 @@ async def research(request: Request) -> StreamingResponse:
                 vault,
                 state=incoming_state,
                 budget_seconds=budget_seconds,
-                model_identifier=model_identifier,
+                profile=profile,
             ):
                 if event.get("type") in ("done", "suspended"):
                     event["usage"] = vault.export_usage()
@@ -214,7 +292,7 @@ async def ask(request: Request) -> StreamingResponse:
                 budget_seconds=_clamped_budget(
                     request_body.get("budget_seconds") or 150.0
                 ),
-                model_identifier=request_body.get("model") or DEFAULT_CHAT_MODEL,
+                profile=_build_profile(request_body),
             ):
                 if event.get("type") == "done":
                     event["usage"] = vault.export_usage()
@@ -283,6 +361,7 @@ async def speak(request: Request) -> JSONResponse:
                 vault,
                 text=block_text,
                 voice_identifier=voice_identifier or "af_heart",
+                profile=_build_profile(request_body),
             )
     except KeyExhausted as exhausted:
         raise HTTPException(status_code=402, detail=str(exhausted))
@@ -303,17 +382,22 @@ async def speak(request: Request) -> JSONResponse:
 async def transcribe(
     audio: UploadFile = File(...),
     secrets: str = Form(...),
+    llm: str = Form("{}"),
 ) -> Dict[str, Any]:
     """Voice question in, text out.
 
     Multipart because Whisper on OpenRouter lives on /audio/transcriptions and
-    takes a file, not a JSON message list. Secrets ride along as a JSON string
-    field since this request cannot have a JSON body.
+    takes a file, not a JSON message list. Since the request cannot have a JSON
+    body, the two JSON envelopes every other endpoint takes arrive as string
+    form fields instead.
     """
     try:
         secrets_payload = json.loads(secrets or "{}")
+        llm_payload = json.loads(llm or "{}")
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="secrets field was not valid JSON.")
+        raise HTTPException(
+            status_code=400, detail="secrets or llm field was not valid JSON."
+        )
 
     vault = SecretVault(secrets_payload)
     _require_providers(vault, ["openrouter"])
@@ -328,6 +412,7 @@ async def transcribe(
             audio_bytes=audio_bytes,
             filename=audio.filename or "question.webm",
             content_type=audio.content_type or "audio/webm",
+            profile=LlmProfile.from_payload(llm_payload),
         )
     except KeyExhausted as exhausted:
         raise HTTPException(status_code=402, detail=str(exhausted))

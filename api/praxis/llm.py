@@ -6,9 +6,10 @@ reading documentation:
   * Chat is the only thing on /chat/completions. Whisper answers HTTP 400 there
     and tells you to use /audio/transcriptions; Kokoro answers 400 and asks for
     `input` instead of `messages`. Three endpoints, not one.
-  * The model runs with reasoning explicitly disabled. It is the non-reasoning
-    variant by request, and passing `reasoning: {"enabled": false}` is what
-    actually holds it there.
+  * Reasoning is off unless asked for. The default model reports
+    mandatory=false with default_enabled=true, so omitting the parameter would
+    silently switch reasoning on and bill for it. Some models refuse to have it
+    disabled at all and answer 400 "Reasoning is mandatory", which is handled.
   * Tool calls come back one at a time from this model, so the loop below does
     not assume a parallel batch — it handles a list of any length.
 """
@@ -19,6 +20,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .keys import SecretVault
 from .transport import (
+    ProviderHttpError,
+    get_json,
     post_for_bytes,
     post_json,
     post_multipart_for_json,
@@ -26,14 +29,103 @@ from .transport import (
 )
 from .tools import TOOL_SCHEMAS, dispatch_tool_call
 
-OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_TRANSCRIBE_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
-OPENROUTER_SPEECH_URL = "https://openrouter.ai/api/v1/audio/speech"
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 SPEECHIFY_SPEECH_URL = "https://api.sws.speechify.com/v1/audio/speech"
 
 DEFAULT_CHAT_MODEL = "~deepseek/deepseek-v4-flash-latest"
 DEFAULT_TRANSCRIBE_MODEL = "openai/whisper-large-v3-turbo"
 DEFAULT_KOKORO_MODEL = "hexgrad/kokoro-82m"
+
+# Reasoning off by default. The default model reports mandatory=false with
+# default_enabled=true, so leaving the parameter out would silently turn reasoning
+# on and bill for it. Sending it explicitly is the only way to hold the
+# non-reasoning behaviour.
+DEFAULT_REASONING = {"enabled": False}
+
+
+class LlmProfile:
+    """Which endpoint to talk to, as which model, with what reasoning setting.
+
+    The endpoint is configurable because any OpenAI-compatible server exposes the
+    same four paths — chat completions, transcriptions, speech, and a model list.
+    OpenRouter is just the default one.
+    """
+
+    def __init__(
+        self,
+        base_url: str = DEFAULT_BASE_URL,
+        model: str = DEFAULT_CHAT_MODEL,
+        reasoning: Optional[Dict[str, Any]] = None,
+        transcribe_model: str = DEFAULT_TRANSCRIBE_MODEL,
+        speech_model: str = DEFAULT_KOKORO_MODEL,
+    ):
+        self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
+        self.model = model or DEFAULT_CHAT_MODEL
+        self.reasoning = DEFAULT_REASONING if reasoning is None else reasoning
+        self.transcribe_model = transcribe_model or DEFAULT_TRANSCRIBE_MODEL
+        self.speech_model = speech_model or DEFAULT_KOKORO_MODEL
+
+    @classmethod
+    def from_payload(cls, payload: Optional[Dict[str, Any]]) -> "LlmProfile":
+        payload = payload or {}
+        # A present-but-null reasoning value means "send no reasoning parameter",
+        # which is what a model with no reasoning support wants. An absent key
+        # means "use the default", which is reasoning off.
+        reasoning = payload["reasoning"] if "reasoning" in payload else None
+        if "reasoning" in payload and payload["reasoning"] is None:
+            reasoning = {}
+        return cls(
+            base_url=payload.get("base_url") or DEFAULT_BASE_URL,
+            model=payload.get("model") or DEFAULT_CHAT_MODEL,
+            reasoning=reasoning,
+            transcribe_model=payload.get("transcribe_model") or DEFAULT_TRANSCRIBE_MODEL,
+            speech_model=payload.get("speech_model") or DEFAULT_KOKORO_MODEL,
+        )
+
+    def reasoning_is_active(self) -> bool:
+        """Whether this profile will actually produce reasoning tokens."""
+        if not self.reasoning:
+            return False
+        return self.reasoning.get("enabled") is not False
+
+    def reasoning_token_allowance(self) -> int:
+        """Extra output budget to request when reasoning is on.
+
+        Reasoning tokens are spent out of `max_tokens`, not from a separate pool,
+        and `exclude: true` hides the trace without stopping the thinking — a run
+        with effort=low and exclude=true was measured truncating a JSON response
+        at 1460 characters that completed cleanly with reasoning off. So the
+        ceiling has to be raised to cover the thinking, or structured output gets
+        cut off mid-string.
+        """
+        if not self.reasoning_is_active():
+            return 0
+        explicit_budget = self.reasoning.get("max_tokens")
+        if isinstance(explicit_budget, int) and explicit_budget > 0:
+            return explicit_budget
+        return {
+            "minimal": 512,
+            "low": 1024,
+            "medium": 2048,
+            "high": 4096,
+            "max": 6144,
+        }.get(str(self.reasoning.get("effort") or "high"), 4096)
+
+    @property
+    def chat_url(self) -> str:
+        return "{0}/chat/completions".format(self.base_url)
+
+    @property
+    def transcribe_url(self) -> str:
+        return "{0}/audio/transcriptions".format(self.base_url)
+
+    @property
+    def speech_url(self) -> str:
+        return "{0}/audio/speech".format(self.base_url)
+
+    @property
+    def models_url(self) -> str:
+        return "{0}/models".format(self.base_url)
 
 # Kokoro exposes no voice listing endpoint — /audio/voices is a 404. These IDs
 # were confirmed one by one against the live endpoint; an unknown ID returns
@@ -55,45 +147,115 @@ MAX_TOOL_ITERATIONS_DEFAULT = 14
 def chat_completion(
     vault: SecretVault,
     messages: List[Dict[str, Any]],
-    model_identifier: str = DEFAULT_CHAT_MODEL,
+    profile: Optional[LlmProfile] = None,
     tools_enabled: bool = False,
     max_tokens: int = 2000,
     temperature: float = 0.7,
     force_json_object: bool = False,
 ) -> Dict[str, Any]:
-    """One round trip to the model. Returns the raw assistant message."""
-    request_payload: Dict[str, Any] = {
-        "model": model_identifier,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "reasoning": {"enabled": False},
-    }
-    if tools_enabled:
-        request_payload["tools"] = TOOL_SCHEMAS
-        request_payload["tool_choice"] = "auto"
-    if force_json_object:
-        request_payload["response_format"] = {"type": "json_object"}
+    """One round trip to the model. Returns the raw response body."""
+    profile = profile or LlmProfile()
+
+    def build_payload(include_reasoning: bool) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": profile.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if include_reasoning and profile.reasoning:
+            payload["reasoning"] = profile.reasoning
+        if tools_enabled:
+            payload["tools"] = TOOL_SCHEMAS
+            payload["tool_choice"] = "auto"
+        if force_json_object:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
 
     def attempt(api_key: str):
-        response_body = post_json(
-            OPENROUTER_CHAT_URL,
-            headers={
-                "Authorization": "Bearer {0}".format(api_key),
-                "Content-Type": "application/json",
-            },
-            payload=request_payload,
-        )
+        headers = {
+            "Authorization": "Bearer {0}".format(api_key),
+            "Content-Type": "application/json",
+        }
+        try:
+            response_body = post_json(
+                profile.chat_url, headers=headers, payload=build_payload(True)
+            )
+        except ProviderHttpError as http_error:
+            # Some models refuse to have reasoning switched off: OpenRouter answers
+            # 400 "Reasoning is mandatory for this endpoint and cannot be disabled."
+            # The UI hides the off switch for those, but a stale saved setting or a
+            # third-party endpoint can still produce it, and dropping the parameter
+            # is strictly better than failing the whole run.
+            if http_error.status_code == 400 and "reasoning is mandatory" in (
+                http_error.body_text or ""
+            ).lower():
+                response_body = post_json(
+                    profile.chat_url, headers=headers, payload=build_payload(False)
+                )
+            else:
+                raise
         reported_cost = float((response_body.get("usage") or {}).get("cost") or 0.0)
         return response_body, {"dollars": reported_cost}
 
     return run_with_rotation(vault.pool("openrouter"), attempt)
 
 
+def list_chat_models(vault: SecretVault, profile: Optional[LlmProfile] = None) -> List[Dict[str, Any]]:
+    """The endpoint's model catalogue, trimmed to what the picker needs.
+
+    The `reasoning` descriptor is the important part and is passed through
+    untouched. It is what lets the settings screen build an honest reasoning
+    control: whether reasoning exists at all, whether it can be turned off
+    (`mandatory`), and which effort values this specific model actually accepts
+    (`supported_efforts` — deepseek-v4-flash takes max/high/low with no medium,
+    while gpt-5 takes high/medium/low/minimal, so a hardcoded list would send
+    values the model never advertised).
+
+    A plain OpenAI-compatible server returns only `id`, so everything else is
+    optional and the picker degrades to a searchable list of names.
+    """
+    profile = profile or LlmProfile()
+
+    def attempt(api_key: str):
+        response_body = get_json(
+            profile.models_url,
+            headers={"Authorization": "Bearer {0}".format(api_key)},
+            timeout_seconds=30.0,
+        )
+        return response_body, {"dollars": 0.0}
+
+    response_body = run_with_rotation(vault.pool("openrouter"), attempt)
+    raw_models = response_body.get("data") if isinstance(response_body, dict) else None
+    if not isinstance(raw_models, list):
+        raw_models = response_body if isinstance(response_body, list) else []
+
+    catalogue: List[Dict[str, Any]] = []
+    for raw_model in raw_models:
+        if not isinstance(raw_model, dict) or not raw_model.get("id"):
+            continue
+        supported_parameters = raw_model.get("supported_parameters") or []
+        pricing = raw_model.get("pricing") or {}
+        catalogue.append(
+            {
+                "id": raw_model["id"],
+                "name": raw_model.get("name") or raw_model["id"],
+                "context_length": raw_model.get("context_length"),
+                "prompt_price": pricing.get("prompt"),
+                "supports_tools": "tools" in supported_parameters,
+                "supports_reasoning": "reasoning" in supported_parameters,
+                "supports_reasoning_effort": "reasoning_effort" in supported_parameters,
+                "supports_include_reasoning": "include_reasoning" in supported_parameters,
+                "reasoning": raw_model.get("reasoning"),
+            }
+        )
+    return catalogue
+
+
 def run_tool_loop(
     vault: SecretVault,
     messages: List[Dict[str, Any]],
-    model_identifier: str = DEFAULT_CHAT_MODEL,
+    profile: Optional[LlmProfile] = None,
     max_iterations: int = MAX_TOOL_ITERATIONS_DEFAULT,
     max_tokens: int = 2000,
     temperature: float = 0.7,
@@ -127,7 +289,7 @@ def run_tool_loop(
         response_body = chat_completion(
             vault,
             messages=messages,
-            model_identifier=model_identifier,
+            profile=profile,
             tools_enabled=True,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -182,14 +344,21 @@ def run_tool_loop(
     yield {"type": "stopped_early", "reason": "max_iterations", "messages": messages}
 
 
-def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+def _extract_json_object(
+    text: str, allow_brace_slice: bool = True
+) -> Optional[Dict[str, Any]]:
     """Best-effort parse of a JSON object out of model output.
 
     Necessary because `response_format: {"type": "json_object"}` is honoured
     structurally by this model but not reliably: it truncates when it runs out of
     tokens, and it has been observed emitting a bare float inside an array of
-    strings. So parse optimistically, then fall back to slicing out the outermost
-    braces, then give up and let the caller retry.
+    strings.
+
+    `allow_brace_slice` is refused when the response was truncated. Recovering a
+    cut-off response by slicing between its outermost braces can only ever produce
+    a partial object, and a partial object that happens to parse is worse than a
+    parse error because the caller believes it. Truncation is better handled by
+    retrying with a bigger ceiling, which is what the caller does.
     """
     if not text:
         return None
@@ -205,6 +374,9 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     except json.JSONDecodeError:
         pass
 
+    if not allow_brace_slice:
+        return None
+
     opening_index = candidate.find("{")
     closing_index = candidate.rfind("}")
     if opening_index == -1 or closing_index <= opening_index:
@@ -219,48 +391,88 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 def chat_json(
     vault: SecretVault,
     messages: List[Dict[str, Any]],
-    model_identifier: str = DEFAULT_CHAT_MODEL,
+    profile: Optional[LlmProfile] = None,
     max_tokens: int = 3000,
     temperature: float = 0.4,
     attempts: int = 3,
+    required_keys: Optional[List[str]] = None,
+    required_non_empty: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Ask for a JSON object and keep asking until one parses.
+    """Ask for a JSON object and keep asking until a complete one parses.
 
-    `max_tokens` defaults high on purpose. The observed failure mode is not bad
-    syntax, it is a response cut off mid-string by the token ceiling.
+    `max_tokens` defaults high on purpose: the observed failure mode is not bad
+    syntax, it is a response cut off mid-string by the token ceiling. Reasoning
+    makes that worse because reasoning tokens come out of the same budget, so the
+    profile's allowance is added on top.
+
+    The two `required_*` arguments guard the quieter failure. This model will
+    happily return syntactically perfect JSON with the right keys and nothing in
+    them — a scoping call was observed returning an empty governing axis and an
+    empty question list, which the graph then carried forward as though research
+    had been scoped. `required_keys` checks a key is present, which is what a
+    legitimately-false boolean like "ready" needs; `required_non_empty` checks it
+    actually has content, which is what a list of questions or blocks needs.
     """
+    profile = profile or LlmProfile()
     conversation = list(messages)
     last_raw_text = ""
+    effective_max_tokens = max_tokens + profile.reasoning_token_allowance()
+
     for attempt_index in range(attempts):
         response_body = chat_completion(
             vault,
             messages=conversation,
-            model_identifier=model_identifier,
+            profile=profile,
             tools_enabled=False,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             temperature=temperature,
             force_json_object=True,
         )
         choices = response_body.get("choices") or []
         if not choices:
             continue
-        last_raw_text = (choices[0].get("message") or {}).get("content") or ""
-        parsed_object = _extract_json_object(last_raw_text)
-        if parsed_object is not None:
-            return parsed_object
-
         was_truncated = choices[0].get("finish_reason") == "length"
+        last_raw_text = (choices[0].get("message") or {}).get("content") or ""
+
+        parsed_object = _extract_json_object(
+            last_raw_text, allow_brace_slice=not was_truncated
+        )
+        if parsed_object is not None:
+            missing_keys = [
+                key for key in (required_keys or []) if key not in parsed_object
+            ]
+            empty_keys = [
+                key for key in (required_non_empty or []) if not parsed_object.get(key)
+            ]
+            if not missing_keys and not empty_keys:
+                return parsed_object
+            last_raw_text = "missing {0}, empty {1}; got {2}".format(
+                missing_keys, empty_keys, sorted(parsed_object.keys())
+            )
+
         if was_truncated:
-            max_tokens = min(int(max_tokens * 2), 12000)
+            effective_max_tokens = min(int(effective_max_tokens * 2), 16000)
         if attempt_index < attempts - 1:
             conversation = list(messages) + [
                 {
                     "role": "user",
                     "content": (
-                        "That response was not parseable JSON"
+                        "That response was not usable"
                         + (" (it was cut off)." if was_truncated else ".")
-                        + " Return one complete, valid JSON object and nothing else. "
-                        "Keep it compact enough to finish."
+                        + " Return one complete, valid JSON object with every key"
+                        + (
+                            " including {0}".format(", ".join(required_keys))
+                            if required_keys
+                            else ""
+                        )
+                        + (
+                            ". These came back empty and must be filled: {0}".format(
+                                ", ".join(required_non_empty)
+                            )
+                            if required_non_empty
+                            else ""
+                        )
+                        + " Return nothing else. Keep it compact enough to finish."
                     ),
                 }
             ]
@@ -277,16 +489,18 @@ def transcribe_audio(
     audio_bytes: bytes,
     filename: str = "question.webm",
     content_type: str = "audio/webm",
-    model_identifier: str = DEFAULT_TRANSCRIBE_MODEL,
+    profile: Optional[LlmProfile] = None,
 ) -> Dict[str, Any]:
     """Voice question in, text out. Multipart, not JSON."""
 
+    profile = profile or LlmProfile()
+
     def attempt(api_key: str):
         response_body = post_multipart_for_json(
-            OPENROUTER_TRANSCRIBE_URL,
+            profile.transcribe_url,
             headers={"Authorization": "Bearer {0}".format(api_key)},
             files={"file": (filename, audio_bytes, content_type)},
-            data={"model": model_identifier},
+            data={"model": profile.transcribe_model},
         )
         reported_cost = float((response_body.get("usage") or {}).get("cost") or 0.0)
         return response_body, {"dollars": reported_cost}
@@ -298,19 +512,20 @@ def synthesize_speech_kokoro(
     vault: SecretVault,
     text: str,
     voice_identifier: str = "af_heart",
-    model_identifier: str = DEFAULT_KOKORO_MODEL,
+    profile: Optional[LlmProfile] = None,
 ) -> Dict[str, Any]:
     """Kokoro answers with raw MP3 bytes and no timing information."""
+    profile = profile or LlmProfile()
 
     def attempt(api_key: str):
         audio_bytes, content_type = post_for_bytes(
-            OPENROUTER_SPEECH_URL,
+            profile.speech_url,
             headers={
                 "Authorization": "Bearer {0}".format(api_key),
                 "Content-Type": "application/json",
             },
             payload={
-                "model": model_identifier,
+                "model": profile.speech_model,
                 "input": text,
                 "voice": voice_identifier,
                 "response_format": "mp3",
@@ -377,8 +592,6 @@ def synthesize_speech_speechify(
 
 def list_speechify_voices(vault: SecretVault) -> List[Dict[str, Any]]:
     """Speechify does publish a voice list, unlike Kokoro."""
-    from .transport import get_json
-
     def attempt(api_key: str):
         response_body = get_json(
             "https://api.sws.speechify.com/v1/voices",

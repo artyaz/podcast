@@ -161,22 +161,63 @@ def lesson_research_system_prompt() -> str:
     return PRAXIS_CORE
 
 
-def scoping_prompt(topic: str) -> str:
-    return """A listener asked for a lesson on this topic:
+def outline_prompt(topic: str, subtopic_count: int) -> str:
+    return """A listener wants an episode on this subject:
 
 {0}
 
+Break it into exactly {1} subtopics that divide the subject evenly and cover it
+without overlapping. Return one JSON object:
+
+  "subtopics" — array of exactly {1} objects, each with:
+      "title" — a short spoken title, the kind a presenter would say out loud.
+                Not a heading like "Background" — name the actual content.
+      "angle" — one sentence on what this segment has to establish, and what
+                would make it worth its runtime.
+
+Rules that matter. Divide by the structure of the subject, not by chronology
+unless chronology genuinely is the structure. Each subtopic must be researchable
+on its own: a listener should be able to start there. Together they should span
+the disagreement, not just the consensus — if the subject is contested, at least
+one subtopic has to be where the sources actually fight. Do not produce a
+subtopic that is only scene-setting, and do not produce two that would be
+answered by the same evidence.""".format(
+        topic, subtopic_count
+    )
+
+
+def scoping_prompt(topic: str, subtopics_text: str = "") -> str:
+    subtopic_section = ""
+    if subtopics_text:
+        subtopic_section = """
+The listener has already chosen the episode's segments, and they are fixed:
+
+{0}
+
+Your open questions must cover these segments and nothing else. Distribute them
+evenly, so no segment goes into research with less evidence behind it than the
+others.
+""".format(
+            subtopics_text
+        )
+
+    question_count = "one or two per segment" if subtopics_text else "4 to 7"
+
+    return """A listener asked for a lesson on this topic:
+
+{0}
+{1}
 Before searching, scope it. Return one JSON object:
 
   "restated"        — the real question underneath the topic, in your own words, one or two sentences
   "layers"          — object with "empirical", "conceptual", "normative": what each layer has to settle here. Use an empty string where a layer genuinely does not apply.
   "governing_axis"  — the tension this question actually turns on, named before any examples arrive
-  "open_questions"  — array of 4 to 7 specific, searchable questions that together would settle the topic. Each must be answerable by evidence, not by opinion. Name statutes, datasets, cases, authors, or jurisdictions wherever you can.
+  "open_questions"  — array of {2} specific, searchable questions that together would settle the topic. Each must be answerable by evidence, not by opinion. Name statutes, datasets, cases, authors, or jurisdictions wherever you can.
   "evidence_channels" — array of 3 to 6 concrete places the evidence actually lives, named specifically: which registry, which court, which statistical series, which literature.
   "expected_disagreements" — array of the points where you expect strong sources to disagree
 
 Be specific. "What do experts think about this?" is not an open question. "What did the 2019 Bundesverfassungsgericht ruling actually hold about the census question?" is.""".format(
-        topic
+        topic, subtopic_section, question_count
     )
 
 
@@ -245,9 +286,27 @@ Be hard on yourself here. A conclusion resting on one unverified recollection is
 
 
 def lesson_writing_prompt(
-    topic: str, scope_digest: str, findings_digest: str, target_block_count: int
+    topic: str,
+    scope_digest: str,
+    findings_digest: str,
+    target_block_count: int,
+    subtopics_text: str = "",
 ) -> str:
+    spine_section = ""
+    if subtopics_text:
+        spine_section = """
+The listener chose these segments, in this order. Cover every one, in order, and
+give them comparable weight — a segment with one thin paragraph while another has
+five reads as a broken promise. Use a heading block to turn into each segment,
+phrased as spoken transition rather than as a title.
+
+{0}
+""".format(
+            subtopics_text
+        )
+
     return """Write the lesson now. Topic: {0}
+{4}
 
 How you scoped it:
 {1}
@@ -259,8 +318,13 @@ Write roughly {3} blocks. This is a podcast episode: it will be spoken into some
 
 Open with the thing itself — the finding or the tension that reframes the question. Carry the argument in prose, name the asymmetries you found, keep the disagreements standing where the evidence leaves them standing, and mark plainly what you could not establish. Every claim that carries weight names its source in speech and attaches it in metadata.
 
-{4}""".format(
-        topic, scope_digest, findings_digest, target_block_count, BLOCK_FORMAT_CONTRACT
+{5}""".format(
+        topic,
+        scope_digest,
+        findings_digest,
+        target_block_count,
+        spine_section,
+        BLOCK_FORMAT_CONTRACT,
     )
 
 

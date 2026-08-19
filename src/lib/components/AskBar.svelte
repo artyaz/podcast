@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { askAt } from '$lib/lesson.svelte';
-	import { backendUrl, hasKey, secretsPayload } from '$lib/settings.svelte';
+	import { backendUrl, hasKey, llmPayload, secretsPayload } from '$lib/settings.svelte';
 
 	interface AskBarProps {
 		/** The block the reader last touched; the answer is inserted after it. */
@@ -102,6 +102,7 @@
 			const formData = new FormData();
 			formData.append('audio', audioBlob, `question.${extension}`);
 			formData.append('secrets', JSON.stringify(secretsPayload()));
+			formData.append('llm', JSON.stringify(llmPayload()));
 
 			const response = await fetch(backendUrl('/api/transcribe'), {
 				method: 'POST',

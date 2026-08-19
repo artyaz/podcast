@@ -36,13 +36,14 @@ except ImportError:  # pragma: no cover
     from typing_extensions import TypedDict  # type: ignore
 
 from .keys import SecretVault
-from .llm import DEFAULT_CHAT_MODEL, chat_completion, chat_json, run_tool_loop
+from .llm import LlmProfile, chat_completion, chat_json, run_tool_loop
 from .prompts import (
     distill_prompt,
     gap_check_prompt,
     inline_question_prompt,
     lesson_research_system_prompt,
     lesson_writing_prompt,
+    outline_prompt,
     research_round_prompt,
     scoping_prompt,
 )
@@ -109,6 +110,10 @@ class ResearchDeadline:
 
 class ResearchState(TypedDict, total=False):
     topic: str
+    # Optional episode spine chosen by the listener before research starts. When
+    # present it constrains scoping and dictates the running order of the written
+    # episode; when absent the graph scopes the topic freely.
+    subtopics: List[Dict[str, str]]
     phase: str
     suspended: bool
     suspend_reason: str
@@ -142,9 +147,18 @@ def new_research_state(
     target_block_count: int = DEFAULT_TARGET_BLOCK_COUNT,
     minimum_rounds: int = DEFAULT_MINIMUM_ROUNDS,
     maximum_rounds: int = DEFAULT_MAXIMUM_ROUNDS,
+    subtopics: Optional[List[Dict[str, str]]] = None,
 ) -> ResearchState:
     return {
         "topic": topic,
+        "subtopics": [
+            {
+                "title": str(entry.get("title") or "").strip(),
+                "angle": str(entry.get("angle") or "").strip(),
+            }
+            for entry in (subtopics or [])
+            if str(entry.get("title") or "").strip()
+        ],
         "phase": "scope",
         "suspended": False,
         "suspend_reason": "",
@@ -174,7 +188,7 @@ def _runtime(config: RunnableConfig):
     return (
         configurable["vault"],
         configurable["deadline"],
-        configurable.get("model_identifier") or DEFAULT_CHAT_MODEL,
+        configurable.get("profile") or LlmProfile(),
     )
 
 
@@ -218,6 +232,21 @@ def _findings_digest(findings: List[Dict[str, Any]], limit: int = 40) -> str:
             )
         )
     return "\n".join(lines)
+
+
+def _subtopics_text(state: ResearchState) -> str:
+    """The chosen spine as a numbered list, or empty when none was chosen."""
+    subtopics = state.get("subtopics") or []
+    if not subtopics:
+        return ""
+    return "\n".join(
+        "{0}. {1}{2}".format(
+            index,
+            entry.get("title") or "",
+            " — {0}".format(entry["angle"]) if entry.get("angle") else "",
+        )
+        for index, entry in enumerate(subtopics, 1)
+    )
 
 
 def _scope_digest(state: ResearchState) -> str:
@@ -270,7 +299,7 @@ def _merge_findings(
 
 
 def scope_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
-    vault, deadline, model_identifier = _runtime(config)
+    vault, deadline, profile = _runtime(config)
     if not deadline.may_start_node(NODE_TIME_REQUIREMENTS["scope"]):
         return _suspend("scope", "not enough time to scope the question")
 
@@ -279,11 +308,16 @@ def scope_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
         vault,
         messages=[
             {"role": "system", "content": lesson_research_system_prompt()},
-            {"role": "user", "content": scoping_prompt(state["topic"])},
+            {
+                "role": "user",
+                "content": scoping_prompt(state["topic"], _subtopics_text(state)),
+            },
         ],
-        model_identifier=model_identifier,
+        profile=profile,
         max_tokens=2500,
         temperature=0.5,
+        required_keys=["open_questions", "governing_axis"],
+        required_non_empty=["open_questions"],
     )
 
     open_questions = [
@@ -319,7 +353,7 @@ def scope_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
 
 
 def research_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
-    vault, deadline, model_identifier = _runtime(config)
+    vault, deadline, profile = _runtime(config)
     if not deadline.may_start_node(NODE_TIME_REQUIREMENTS["research"]):
         return _suspend("research", "not enough time for a research round")
 
@@ -355,7 +389,7 @@ def research_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any
     for loop_event in run_tool_loop(
         vault,
         messages=conversation,
-        model_identifier=model_identifier,
+        profile=profile,
         max_iterations=16,
         max_tokens=2500,
         temperature=0.6,
@@ -428,7 +462,7 @@ def research_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any
             wrap_up = chat_completion(
                 vault,
                 messages=conversation,
-                model_identifier=model_identifier,
+                profile=profile,
                 tools_enabled=False,
                 max_tokens=2200,
                 temperature=0.4,
@@ -457,7 +491,7 @@ def research_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any
 
 
 def distill_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
-    vault, deadline, model_identifier = _runtime(config)
+    vault, deadline, profile = _runtime(config)
     if not deadline.may_start_node(NODE_TIME_REQUIREMENTS["distill"]):
         return _suspend("distill", "not enough time to distill findings")
 
@@ -472,9 +506,10 @@ def distill_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]
             {"role": "system", "content": lesson_research_system_prompt()},
             {"role": "user", "content": distill_prompt(briefing_text)},
         ],
-        model_identifier=model_identifier,
+        profile=profile,
         max_tokens=4000,
         temperature=0.3,
+        required_keys=["findings"],
     )
 
     merged_findings = _merge_findings(
@@ -508,7 +543,7 @@ def distill_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]
 
 
 def gap_check_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
-    vault, deadline, model_identifier = _runtime(config)
+    vault, deadline, profile = _runtime(config)
     if not deadline.may_start_node(NODE_TIME_REQUIREMENTS["gap_check"]):
         return _suspend("gap_check", "not enough time to audit the findings")
 
@@ -533,9 +568,10 @@ def gap_check_node(state: ResearchState, config: RunnableConfig) -> Dict[str, An
                 ),
             },
         ],
-        model_identifier=model_identifier,
+        profile=profile,
         max_tokens=1800,
         temperature=0.3,
+        required_keys=["ready"],
     )
 
     model_says_ready = bool(audit.get("ready"))
@@ -595,7 +631,7 @@ def gap_check_node(state: ResearchState, config: RunnableConfig) -> Dict[str, An
 
 
 def write_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
-    vault, deadline, model_identifier = _runtime(config)
+    vault, deadline, profile = _runtime(config)
     if not deadline.may_start_node(NODE_TIME_REQUIREMENTS["write"]):
         return _suspend("write", "not enough time to write the lesson")
 
@@ -613,6 +649,7 @@ def write_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
         target_block_count=int(
             state.get("target_block_count") or DEFAULT_TARGET_BLOCK_COUNT
         ),
+        subtopics_text=_subtopics_text(state),
     )
 
     if evidenced_count == 0:
@@ -643,9 +680,11 @@ def write_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
             {"role": "system", "content": lesson_research_system_prompt()},
             {"role": "user", "content": writing_instruction},
         ],
-        model_identifier=model_identifier,
+        profile=profile,
         max_tokens=9000,
         temperature=0.75,
+        required_keys=["blocks"],
+        required_non_empty=["blocks"],
     )
 
     normalized_blocks = normalize_blocks(written.get("blocks") or [])
@@ -767,7 +806,7 @@ def run_research_slice(
     vault: SecretVault,
     state: ResearchState,
     budget_seconds: float = 240.0,
-    model_identifier: str = DEFAULT_CHAT_MODEL,
+    profile: Optional[LlmProfile] = None,
 ):
     """Advance the research as far as this invocation's clock allows.
 
@@ -779,7 +818,7 @@ def run_research_slice(
         "configurable": {
             "vault": vault,
             "deadline": deadline,
-            "model_identifier": model_identifier,
+            "profile": profile or LlmProfile(),
         },
         "recursion_limit": 80,
     }
@@ -810,7 +849,7 @@ def answer_inline_question(
     surrounding_context: str,
     findings: List[Dict[str, Any]],
     budget_seconds: float = 150.0,
-    model_identifier: str = DEFAULT_CHAT_MODEL,
+    profile: Optional[LlmProfile] = None,
 ):
     """The fast path: a question asked mid-lesson, answered in a few blocks.
 
@@ -819,6 +858,7 @@ def answer_inline_question(
     cap. The standard on fabrication does not relax — only the depth does.
     """
     deadline = ResearchDeadline(budget_seconds)
+    profile = profile or LlmProfile()
     conversation = [
         {"role": "system", "content": lesson_research_system_prompt()},
         {
@@ -836,7 +876,7 @@ def answer_inline_question(
     for loop_event in run_tool_loop(
         vault,
         messages=conversation,
-        model_identifier=model_identifier,
+        profile=profile,
         max_iterations=8,
         max_tokens=4000,
         temperature=0.6,
@@ -877,9 +917,11 @@ def answer_inline_question(
                         ),
                     },
                 ],
-                model_identifier=model_identifier,
+                profile=profile,
                 max_tokens=3500,
                 temperature=0.3,
+                required_keys=["blocks"],
+                required_non_empty=["blocks"],
             )
             blocks = normalize_blocks(structured.get("blocks") or [])
         except ValueError:
@@ -895,3 +937,40 @@ def answer_inline_question(
         "blocks": blocks,
         "elapsed_seconds": round(deadline.elapsed(), 1),
     }
+
+
+def propose_subtopics(
+    vault: SecretVault,
+    topic: str,
+    subtopic_count: int,
+    profile: Optional[LlmProfile] = None,
+) -> List[Dict[str, str]]:
+    """Split a subject into an even spine of segments, before research begins.
+
+    Deliberately not a graph node: it runs while the listener is still deciding
+    whether to proceed, its result is theirs to accept or discard, and nothing
+    should be researched until they do. One cheap call, no tools.
+    """
+    requested = max(2, min(int(subtopic_count or 5), 12))
+    outline = chat_json(
+        vault,
+        messages=[
+            {"role": "system", "content": lesson_research_system_prompt()},
+            {"role": "user", "content": outline_prompt(topic, requested)},
+        ],
+        profile=profile or LlmProfile(),
+        max_tokens=2200,
+        temperature=0.6,
+        required_keys=["subtopics"],
+        required_non_empty=["subtopics"],
+    )
+
+    proposed: List[Dict[str, str]] = []
+    for entry in outline.get("subtopics") or []:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title") or "").strip()
+        if not title:
+            continue
+        proposed.append({"title": title, "angle": str(entry.get("angle") or "").strip()})
+    return proposed[:requested]

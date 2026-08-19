@@ -1,4 +1,4 @@
-import { absorbUsage, backendUrl, secretsPayload, settings } from './settings.svelte';
+import { absorbUsage, backendUrl, llmPayload, secretsPayload, settings } from './settings.svelte';
 import { lesson, type Block } from './lesson.svelte';
 
 /**
@@ -64,7 +64,8 @@ async function synthesizeBlock(block: Block): Promise<CachedAudio> {
 			provider: settings.speechProvider,
 			voice: currentVoice(),
 			speechify_model: settings.speechifyModel,
-			secrets: secretsPayload()
+			secrets: secretsPayload(),
+			llm: llmPayload()
 		})
 	});
 
