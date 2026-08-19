@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { askAt } from '$lib/lesson.svelte';
-	import { backendUrl, hasKey, llmPayload, secretsPayload } from '$lib/settings.svelte';
+	import { hasKey } from '$lib/settings.svelte';
+	import { startRecording as startMic, stopRecording as stopMic, transcribeBlob } from '$lib/voice';
 
 	interface AskBarProps {
 		/** The block the reader last touched; the answer is inserted after it. */
@@ -13,9 +14,6 @@
 	let recording = $state(false);
 	let transcribing = $state(false);
 	let statusMessage = $state('');
-
-	let mediaRecorder: MediaRecorder | null = null;
-	let recordedChunks: Blob[] = [];
 
 	/**
 	 * The bar sits above the on-screen keyboard rather than behind it.
@@ -53,81 +51,24 @@
 		await askAt(anchorBlockId, question);
 	}
 
-	function pickRecordingMimeType(): string {
-		// Safari records audio/mp4; Chrome and Firefox prefer webm/opus. Whisper
-		// accepts both, so the choice is only about what the browser can produce.
-		const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
-		for (const candidate of candidates) {
-			if (MediaRecorder.isTypeSupported(candidate)) return candidate;
-		}
-		return '';
-	}
-
 	async function startRecording() {
 		statusMessage = '';
 		try {
-			const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-			const mimeType = pickRecordingMimeType();
-			mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-			recordedChunks = [];
-
-			mediaRecorder.ondataavailable = (event) => {
-				if (event.data.size) recordedChunks.push(event.data);
-			};
-			mediaRecorder.onstop = async () => {
-				stream.getTracks().forEach((track) => track.stop());
-				await transcribeAndAsk(new Blob(recordedChunks, { type: mimeType || 'audio/webm' }));
-			};
-
-			mediaRecorder.start();
+			await startMic();
 			recording = true;
 		} catch (failure) {
 			statusMessage = `Microphone unavailable: ${(failure as Error).message}`;
 		}
 	}
 
-	function stopRecording() {
+	async function stopRecording() {
 		recording = false;
-		mediaRecorder?.stop();
-		mediaRecorder = null;
-	}
-
-	async function transcribeAndAsk(audioBlob: Blob) {
-		if (!audioBlob.size) return;
 		transcribing = true;
 		statusMessage = 'Transcribing…';
-
 		try {
-			const extension = audioBlob.type.includes('mp4') ? 'mp4' : 'webm';
-			const formData = new FormData();
-			formData.append('audio', audioBlob, `question.${extension}`);
-			formData.append('secrets', JSON.stringify(secretsPayload()));
-			formData.append('llm', JSON.stringify(llmPayload()));
-
-			const response = await fetch(backendUrl('/api/transcribe'), {
-				method: 'POST',
-				body: formData
-			});
-			if (!response.ok) {
-				let detail = `HTTP ${response.status}`;
-				try {
-					detail = (await response.json()).detail || detail;
-				} catch {
-					/* keep the status line */
-				}
-				throw new Error(detail);
-			}
-
-			const payload = await response.json();
-			const spokenQuestion = (payload.text || '').trim();
-			if (!spokenQuestion) {
-				statusMessage = 'Nothing was audible in that recording.';
-				return;
-			}
-
+			const blob = await stopMic();
+			const spokenQuestion = await transcribeBlob(blob);
 			statusMessage = '';
-			// Straight into the lesson: no confirmation step, so the answer starts
-			// shimmering the moment the words are known.
 			await askAt(anchorBlockId, spokenQuestion);
 		} catch (failure) {
 			statusMessage = (failure as Error).message;

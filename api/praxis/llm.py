@@ -37,6 +37,21 @@ DEFAULT_CHAT_MODEL = "~deepseek/deepseek-v4-flash-latest"
 DEFAULT_TRANSCRIBE_MODEL = "openai/whisper-large-v3-turbo"
 DEFAULT_KOKORO_MODEL = "hexgrad/kokoro-82m"
 
+# OpenRouter's /audio/speech validator says "Use format: provider/model" and has
+# been observed rejecting `hexgrad/kokoro-82m` even though that is the catalog
+# id. hexgrad is the HuggingFace org; DeepInfra/Together are the providers.
+# Try the catalog slug first, then the provider-qualified forms.
+KOKORO_MODEL_CANDIDATES = (
+    "hexgrad/kokoro-82m",
+    "deepinfra/hexgrad/kokoro-82m",
+    "together/hexgrad/kokoro-82m",
+)
+TRANSCRIBE_MODEL_CANDIDATES = (
+    "openai/whisper-large-v3-turbo",
+    "openai/whisper-large-v3",
+    "openai/whisper-1",
+)
+
 # Reasoning off by default. The default model reports mandatory=false with
 # default_enabled=true, so leaving the parameter out would silently turn reasoning
 # on and bill for it. Sending it explicitly is the only way to hold the
@@ -627,6 +642,31 @@ def chat_json(
     )
 
 
+def _audio_format(filename: str, content_type: str) -> str:
+    haystack = "{0} {1}".format(content_type or "", filename or "").lower()
+    if "webm" in haystack:
+        return "webm"
+    if "wav" in haystack:
+        return "wav"
+    if "mp3" in haystack or "mpeg" in haystack:
+        return "mp3"
+    if "m4a" in haystack or "mp4" in haystack or "aac" in haystack:
+        return "mp4"
+    if "ogg" in haystack or "opus" in haystack:
+        return "ogg"
+    if "flac" in haystack:
+        return "flac"
+    return "webm"
+
+
+def _transcribe_models(requested: str) -> List[str]:
+    ordered: List[str] = []
+    for model_id in (requested, *TRANSCRIBE_MODEL_CANDIDATES):
+        if model_id and model_id not in ordered:
+            ordered.append(model_id)
+    return ordered
+
+
 def transcribe_audio(
     vault: SecretVault,
     audio_bytes: bytes,
@@ -634,21 +674,75 @@ def transcribe_audio(
     content_type: str = "audio/webm",
     profile: Optional[LlmProfile] = None,
 ) -> Dict[str, Any]:
-    """Voice question in, text out. Multipart, not JSON."""
+    """Voice question in, text out.
+
+    OpenRouter's current transcriptions API wants JSON with base64
+    `input_audio`. Multipart is still accepted by OpenAI-compatible gateways, so
+    a 400/415 on the JSON path falls back to that. Either way the model slug
+    must be `provider/model` — `whisper-1` is rejected.
+    """
 
     profile = profile or LlmProfile()
+    audio_format = _audio_format(filename, content_type)
+    encoded_audio = base64.b64encode(audio_bytes).decode("ascii")
+    last_error: Optional[ProviderHttpError] = None
 
-    def attempt(api_key: str):
-        response_body = post_multipart_for_json(
-            profile.transcribe_url,
-            headers={"Authorization": bearer_header(api_key)},
-            files={"file": (filename, audio_bytes, content_type)},
-            data={"model": profile.transcribe_model},
-        )
-        reported_cost = float((response_body.get("usage") or {}).get("cost") or 0.0)
-        return response_body, {"dollars": reported_cost}
+    for model_id in _transcribe_models(profile.transcribe_model):
+        def attempt(api_key: str, chosen_model: str = model_id):
+            headers = {
+                "Authorization": bearer_header(api_key),
+                "Content-Type": "application/json",
+            }
+            try:
+                response_body = post_json(
+                    profile.transcribe_url,
+                    headers=headers,
+                    payload={
+                        "model": chosen_model,
+                        "input_audio": {
+                            "data": encoded_audio,
+                            "format": audio_format,
+                        },
+                    },
+                    timeout_seconds=90.0,
+                )
+            except ProviderHttpError as http_error:
+                if http_error.status_code not in (400, 415, 422):
+                    raise
+                response_body = post_multipart_for_json(
+                    profile.transcribe_url,
+                    headers={"Authorization": bearer_header(api_key)},
+                    files={"file": (filename, audio_bytes, content_type or "audio/webm")},
+                    data={"model": chosen_model},
+                    timeout_seconds=90.0,
+                )
+            reported_cost = float((response_body.get("usage") or {}).get("cost") or 0.0)
+            return response_body, {"dollars": reported_cost}
 
-    return run_with_rotation(vault.pool("openrouter"), attempt)
+        try:
+            return run_with_rotation(vault.pool("openrouter"), attempt)
+        except ProviderHttpError as http_error:
+            last_error = http_error
+            if http_error.status_code != 400:
+                raise
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise ProviderHttpError(502, "transcription returned no usable response")
+
+
+def _speech_model_candidates(requested: str) -> List[str]:
+    raw = (requested or DEFAULT_KOKORO_MODEL).strip()
+    ordered: List[str] = []
+    if raw and "/" not in raw:
+        ordered.append("hexgrad/{0}".format(raw))
+    if raw:
+        ordered.append(raw)
+    for candidate in KOKORO_MODEL_CANDIDATES:
+        if candidate not in ordered:
+            ordered.append(candidate)
+    return ordered
 
 
 def synthesize_speech_kokoro(
@@ -659,30 +753,46 @@ def synthesize_speech_kokoro(
 ) -> Dict[str, Any]:
     """Kokoro answers with raw MP3 bytes and no timing information."""
     profile = profile or LlmProfile()
+    last_error: Optional[ProviderHttpError] = None
 
-    def attempt(api_key: str):
-        audio_bytes, content_type = post_for_bytes(
-            profile.speech_url,
-            headers={
-                "Authorization": bearer_header(api_key),
-                "Content-Type": "application/json",
-            },
-            payload={
-                "model": profile.speech_model,
-                "input": text,
-                "voice": voice_identifier,
-                "response_format": "mp3",
-            },
-        )
-        result = {
-            "audio_bytes": audio_bytes,
-            "content_type": content_type or "audio/mpeg",
-            "speech_marks": None,
-            "billable_characters": len(text),
-        }
-        return result, {"characters": len(text)}
+    for model_id in _speech_model_candidates(profile.speech_model):
+        def attempt(api_key: str, chosen_model: str = model_id):
+            audio_bytes, content_type = post_for_bytes(
+                profile.speech_url,
+                headers={
+                    "Authorization": bearer_header(api_key),
+                    "Content-Type": "application/json",
+                },
+                payload={
+                    "model": chosen_model,
+                    "input": text,
+                    "voice": voice_identifier,
+                    "response_format": "mp3",
+                    "provider": {"order": ["DeepInfra", "Together"]},
+                },
+            )
+            result = {
+                "audio_bytes": audio_bytes,
+                "content_type": content_type or "audio/mpeg",
+                "speech_marks": None,
+                "billable_characters": len(text),
+            }
+            return result, {"characters": len(text)}
 
-    return run_with_rotation(vault.pool("openrouter"), attempt)
+        try:
+            return run_with_rotation(vault.pool("openrouter"), attempt)
+        except ProviderHttpError as http_error:
+            last_error = http_error
+            body = (http_error.body_text or "").lower()
+            if http_error.status_code == 400 and (
+                "speech model" in body or "provider/model" in body
+            ):
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+    raise ProviderHttpError(502, "speech returned no audio")
 
 
 def _wrap_with_emotion(text: str, emotion: Optional[str]) -> str:

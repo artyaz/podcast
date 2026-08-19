@@ -1,5 +1,6 @@
 import unittest
 
+from praxis.llm import _audio_format, _speech_model_candidates
 from praxis.plan import apply_plan_patches, mark_written, next_unwritten, plan_from_model
 from praxis.transport import collapse_streamed_completion
 from praxis.vault_store import merge_rows
@@ -54,6 +55,26 @@ class PlanPatchTests(unittest.TestCase):
         nxt = next_unwritten(written)
         self.assertIsNotNone(nxt)
         self.assertEqual(nxt["id"], "sec_2")
+
+
+class SpeechModelSlugTests(unittest.TestCase):
+    def test_bare_kokoro_id_gets_a_provider_prefix(self):
+        candidates = _speech_model_candidates("kokoro-82m")
+        self.assertTrue(candidates[0].startswith("hexgrad/"))
+        self.assertIn("hexgrad/kokoro-82m", candidates)
+
+    def test_catalog_slug_stays_first(self):
+        candidates = _speech_model_candidates("hexgrad/kokoro-82m")
+        self.assertEqual(candidates[0], "hexgrad/kokoro-82m")
+        self.assertIn("deepinfra/hexgrad/kokoro-82m", candidates)
+
+
+class AudioFormatTests(unittest.TestCase):
+    def test_webm_from_browser_recording(self):
+        self.assertEqual(_audio_format("question.webm", "audio/webm;codecs=opus"), "webm")
+
+    def test_safari_mp4(self):
+        self.assertEqual(_audio_format("question.mp4", "audio/mp4"), "mp4")
 
 
 class StreamCollapseTests(unittest.TestCase):

@@ -8,6 +8,8 @@
 		splitBlockAt,
 		type Block
 	} from '$lib/lesson.svelte';
+	import { hasKey } from '$lib/settings.svelte';
+	import { startRecording as startMic, stopRecording as stopMic, transcribeBlob } from '$lib/voice';
 
 	interface BlockViewProps {
 		block: Block;
@@ -36,6 +38,9 @@
 	let textAtFocus = $state('');
 	let isDirty = $state(false);
 	let hasFocus = $state(false);
+	let recording = $state(false);
+	let transcribing = $state(false);
+	let voiceError = $state('');
 
 	let longPressTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -73,15 +78,42 @@
 		// that clicking it causes. Dirtiness is cleared on submit, not on blur.
 	}
 
-	async function submitQuestion() {
-		const questionText = block.text.trim();
-		if (!questionText) return;
+	async function askFromHere(questionText: string, replaceCurrent: boolean) {
+		const trimmed = questionText.trim();
+		if (!trimmed) return;
 		isDirty = false;
-		// The reader's own typing became the question. Remove the block they typed
-		// into and let askAt re-insert it as a proper question block with its answer.
-		const anchorBlockId = previousBlockId;
-		removeBlock(block.id);
-		await askAt(anchorBlockId, questionText);
+		voiceError = '';
+		const anchorBlockId = replaceCurrent ? previousBlockId : block.id;
+		if (replaceCurrent) removeBlock(block.id);
+		await askAt(anchorBlockId, trimmed);
+	}
+
+	async function submitQuestion() {
+		await askFromHere(block.text, true);
+	}
+
+	async function toggleMic() {
+		voiceError = '';
+		if (recording) {
+			recording = false;
+			transcribing = true;
+			try {
+				const blob = await stopMic();
+				const spoken = await transcribeBlob(blob);
+				await askFromHere(spoken, isDirty);
+			} catch (failure) {
+				voiceError = (failure as Error).message;
+			} finally {
+				transcribing = false;
+			}
+			return;
+		}
+		try {
+			await startMic();
+			recording = true;
+		} catch (failure) {
+			voiceError = `Microphone unavailable: ${(failure as Error).message}`;
+		}
 	}
 
 	function caretOffset(element: HTMLElement): number {
@@ -227,10 +259,32 @@
 	{/if}
 </div>
 
-{#if isDirty && !block.pending}
+{#if !block.pending && (isDirty || hasFocus || recording || transcribing || voiceError)}
 	<div class="submitbar">
-		<button class="submit" onclick={submitQuestion}>Ask this →</button>
-		<span class="hint">⌘↵</span>
+		{#if isDirty}
+			<button class="submit" onclick={submitQuestion}>Ask this →</button>
+			<span class="hint">⌘↵</span>
+		{/if}
+		<button
+			class="mic"
+			class:recording
+			onmousedown={(event) => event.preventDefault()}
+			onclick={toggleMic}
+			disabled={transcribing || !hasKey('openrouter')}
+			aria-label={recording ? 'Stop recording' : 'Ask by voice'}
+			title={hasKey('openrouter') ? 'Ask by voice' : 'Add an OpenRouter key in Settings'}
+		>
+			{#if transcribing}
+				<span class="spinner"></span>
+			{:else if recording}
+				◼
+			{:else}
+				●
+			{/if}
+		</button>
+		{#if voiceError}
+			<span class="voiceerr">{voiceError}</span>
+		{/if}
 	</div>
 {/if}
 
@@ -380,5 +434,27 @@
 	.hint {
 		font-size: 12px;
 		color: var(--muted);
+	}
+	.mic {
+		width: 34px;
+		height: 34px;
+		border-radius: 50%;
+		border: 1.5px solid var(--line);
+		background: var(--panel);
+		color: var(--muted);
+		font-size: 12px;
+		line-height: 1;
+	}
+	.mic.recording {
+		border-color: var(--bad);
+		color: var(--bad);
+	}
+	.mic:disabled {
+		opacity: 0.4;
+	}
+	.voiceerr {
+		font-size: 12px;
+		color: var(--bad);
+		line-height: 1.4;
 	}
 </style>

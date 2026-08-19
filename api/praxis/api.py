@@ -572,6 +572,18 @@ async def transcribe(
         )
     except KeyExhausted as exhausted:
         raise HTTPException(status_code=402, detail=str(exhausted))
+    except ProviderHttpError as provider_error:
+        raise HTTPException(
+            status_code=502,
+            detail="transcription failed: {0}".format(provider_error.diagnosis()),
+        )
+    except Exception as unexpected:  # noqa: BLE001 - must not become a blank 500
+        raise HTTPException(
+            status_code=502,
+            detail="transcription failed: {0}: {1}".format(
+                type(unexpected).__name__, str(unexpected)[:240]
+            ),
+        )
 
     return {
         "text": (transcription.get("text") or "").strip(),
