@@ -3,7 +3,8 @@ import {
 	onLessonChange,
 	type Block,
 	type PlanItem,
-	type ResearchActivity
+	type ResearchActivity,
+	type WorkBeat
 } from './lesson.svelte';
 import { putPlain, readPlain } from './vault.svelte';
 
@@ -21,22 +22,21 @@ export interface LessonRecord {
 	phase: string;
 	slicesUsed: number;
 	activity: ResearchActivity[];
+	work: WorkBeat[];
 	errorMessage: string;
 }
 
-export type LibraryView = 'library' | 'topics' | 'lesson';
+export type LibraryView = 'library' | 'lesson';
 
 interface LibraryState {
 	lessons: LessonRecord[];
 	activeId: string | null;
-	activeSectionId: string | null;
 	view: LibraryView;
 }
 
 export const library = $state<LibraryState>({
 	lessons: [],
 	activeId: null,
-	activeSectionId: null,
 	view: 'library'
 });
 
@@ -82,7 +82,10 @@ export function hydrateLibrary(rows: Record<string, unknown>) {
 		if (record?.id && !seen.has(record.id)) loaded.push(record);
 	}
 	loaded.sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
-	for (const record of loaded) record.running = false;
+	for (const record of loaded) {
+		record.running = false;
+		record.work = record.work || [];
+	}
 	library.lessons = loaded;
 }
 
@@ -102,6 +105,7 @@ export function persistActiveFromWorkingDocument() {
 		phase: lesson.phase,
 		slicesUsed: lesson.slicesUsed,
 		activity: lesson.activity,
+		work: lesson.work,
 		errorMessage: lesson.errorMessage
 	});
 }
@@ -117,6 +121,7 @@ export function loadWorkingDocument(record: LessonRecord) {
 	lesson.phase = record.phase;
 	lesson.slicesUsed = record.slicesUsed;
 	lesson.activity = record.activity || [];
+	lesson.work = record.work || [];
 	lesson.errorMessage = record.errorMessage || '';
 }
 
@@ -135,11 +140,11 @@ export function createLesson(topic: string): LessonRecord {
 		phase: '',
 		slicesUsed: 0,
 		activity: [],
+		work: [],
 		errorMessage: ''
 	};
 	library.lessons.unshift(record);
 	library.activeId = record.id;
-	library.activeSectionId = null;
 	library.view = 'library';
 	void putPlain(`lesson:${record.id}`, record);
 	void putPlain(
@@ -154,36 +159,12 @@ export function openLesson(recordId: string) {
 	if (!record) return;
 	library.activeId = recordId;
 	loadWorkingDocument(record);
-	if ((record.plan || []).length) {
-		library.view = 'topics';
-		library.activeSectionId = null;
-	} else if (record.blocks.length) {
-		library.view = 'lesson';
-		library.activeSectionId = null;
-	} else {
-		library.view = 'topics';
-	}
-}
-
-export function openSection(sectionId: string) {
-	library.activeSectionId = sectionId;
 	library.view = 'lesson';
 }
 
 export function backToLibrary() {
 	persistActiveFromWorkingDocument();
 	library.view = 'library';
-	library.activeSectionId = null;
-}
-
-export function backToTopics() {
-	library.view = 'topics';
-	library.activeSectionId = null;
-}
-
-export function sectionBlocks(sectionId: string | null): Block[] {
-	if (!sectionId) return lesson.blocks;
-	return lesson.blocks.filter((block) => block.sectionId === sectionId);
 }
 
 /** Used so the first unlock can restore a lesson that was only in memory. */

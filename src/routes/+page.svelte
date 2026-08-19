@@ -2,33 +2,28 @@
 	import AskBar from '$lib/components/AskBar.svelte';
 	import BlockActions from '$lib/components/BlockActions.svelte';
 	import BlockView from '$lib/components/BlockView.svelte';
+	import ReasoningLog from '$lib/components/ReasoningLog.svelte';
 	import SubtopicModal from '$lib/components/SubtopicModal.svelte';
 	import { playFrom, playback, stopPlayback } from '$lib/audio.svelte';
 	import {
 		activeLesson,
 		backToLibrary,
-		backToTopics,
 		createLesson,
 		library,
-		openLesson,
-		openSection,
-		sectionBlocks
+		openLesson
 	} from '$lib/library.svelte';
-	import { lesson, runResearch, type Block } from '$lib/lesson.svelte';
+	import { lesson, runResearch, type Block, type WorkBeat } from '$lib/lesson.svelte';
 	import { canResearch, settings } from '$lib/settings.svelte';
 
 	let topicDraft = $state('');
 	let showSubtopicModal = $state(false);
 	let sheetBlock = $state<Block | null>(null);
 	let anchorBlockId = $state<string | null>(null);
+	let expandedWork = $state<WorkBeat[] | null>(null);
 
 	const current = $derived(activeLesson());
-	const visibleBlocks = $derived(sectionBlocks(library.activeSectionId));
-	const firstBlockId = $derived(visibleBlocks[0]?.id ?? null);
-	const activePlanItem = $derived(
-		lesson.plan.find((item) => item.id === library.activeSectionId) ?? null
-	);
-	const recentActivity = $derived(lesson.activity.slice(-5).reverse());
+	const firstBlockId = $derived(lesson.blocks[0]?.id ?? null);
+	const stillWriting = $derived(Boolean(current?.running || lesson.running));
 
 	function startResearch(subtopics: { title: string; angle?: string }[] = []) {
 		const topic = topicDraft.trim();
@@ -47,23 +42,28 @@
 		startResearch(subtopics);
 	}
 
-	function writtenCount(record: { plan: { status?: string }[]; finished: boolean }) {
-		if (!record.plan.length) return record.finished ? 1 : 0;
-		return record.plan.filter((item) => item.status === 'written').length;
-	}
-
-	function cardStatus(record: {
+	function itemStatus(record: {
 		running: boolean;
 		finished: boolean;
-		phase: string;
 		errorMessage: string;
-		plan: { status?: string }[];
+		blocks: { id: string }[];
 	}) {
 		if (record.errorMessage) return 'stopped';
-		if (record.running) return record.phase || 'researching';
-		if (record.finished) return 'ready';
-		if (record.plan.some((item) => item.status === 'written')) return 'in progress';
+		if (record.running && record.blocks.length) return 'writing';
+		if (record.running) return 'researching';
+		if (record.finished || record.blocks.length) return 'ready';
 		return 'draft';
+	}
+
+	function itemInfo(record: { blocks: { id: string }[]; running: boolean }) {
+		if (record.running && !record.blocks.length) return 'in progress';
+		if (record.blocks.length) return `${record.blocks.length} blocks`;
+		return '';
+	}
+
+	function workFor(record: { id: string; work?: WorkBeat[] }) {
+		if (record.id === library.activeId && lesson.work.length) return lesson.work;
+		return record.work || [];
 	}
 </script>
 
@@ -79,7 +79,7 @@
 			<h1>What should this episode be about?</h1>
 			<p class="lede">
 				Name a question worth arguing about. It gets scoped, researched against primary sources,
-				audited for what is missing, and written to be listened to — one chapter at a time.
+				audited for what is missing, and written to be listened to.
 			</p>
 
 			<textarea
@@ -119,33 +119,29 @@
 		</div>
 
 		{#if library.lessons.length}
-			<ul class="cards">
+			<ul class="entries">
 				{#each library.lessons as record (record.id)}
 					<li>
-						<button class="card" onclick={() => openLesson(record.id)}>
+						<button class="entry" onclick={() => openLesson(record.id)}>
 							<h2>{record.topic}</h2>
-							<p class="cardmeta">
-								<span class="status">{cardStatus(record)}</span>
-								{#if record.plan.length}
-									<span>{writtenCount(record)} of {record.plan.length} sections</span>
+							<p class="meta">
+								<span>{itemStatus(record)}</span>
+								{#if itemInfo(record)}
+									<span>{itemInfo(record)}</span>
 								{/if}
 							</p>
-							{#if record.id === library.activeId && record.running}
-								<ul class="cardactivity">
-									{#each recentActivity.slice(0, 4) as entry, entryIndex (entryIndex)}
-										<li>{entry.text}</li>
-									{/each}
-								</ul>
-							{:else if record.errorMessage}
-								<p class="carderror">{record.errorMessage}</p>
-							{:else if record.plan.length}
-								<ol class="cardplan">
-									{#each record.plan.slice(0, 4) as item (item.id)}
-										<li class:done={item.status === 'written'}>{item.title}</li>
-									{/each}
-								</ol>
-							{/if}
 						</button>
+						{#if record.running || (record.id === library.activeId && lesson.running)}
+							<ReasoningLog
+								beats={workFor(record)}
+								running={true}
+								cap={3}
+								onExpand={() => (expandedWork = workFor(record))}
+							/>
+						{/if}
+						{#if record.errorMessage}
+							<p class="itemerror">{record.errorMessage}</p>
+						{/if}
 					</li>
 				{/each}
 			</ul>
@@ -159,55 +155,25 @@
 			onProceed={beginWithSegments}
 		/>
 	{/if}
-{:else if library.view === 'topics'}
-	<div class="topics">
+{:else}
+	<div class="lesson" class:hasbar={lesson.blocks.length > 0}>
 		<button class="back" onclick={backToLibrary}>← Library</button>
 		<h1 class="topic">{lesson.topic}</h1>
-		{#if lesson.running}
-			<p class="lede">{lesson.phase || 'working'} · progress lives on the library card</p>
-		{/if}
-		{#if lesson.errorMessage}
-			<p class="railerror">{lesson.errorMessage}</p>
-		{/if}
-		{#if lesson.plan.length}
-			<ol class="topiclist">
-				{#each lesson.plan as item (item.id)}
-					<li>
-						<button class="topicrow" onclick={() => openSection(item.id)}>
-							<span class="tmark" class:done={item.status === 'written'}></span>
-							<span class="tbody">
-								<span class="ttitle">{item.title}</span>
-								{#if item.angle}<span class="tangle">{item.angle}</span>{/if}
-							</span>
-							<span class="tstat">{item.status === 'written' ? 'ready' : 'pending'}</span>
-						</button>
-					</li>
-				{/each}
-			</ol>
-		{:else}
-			<p class="lede">
-				{lesson.running
-					? 'The plan will land here once the brainstorming pass finishes.'
-					: 'No sections yet.'}
-			</p>
-		{/if}
-	</div>
-{:else}
-	<div class="lesson" class:hasbar={visibleBlocks.length > 0}>
-		<button class="back" onclick={current?.plan.length ? backToTopics : backToLibrary}>
-			{current?.plan.length ? '← Sections' : '← Library'}
-		</button>
-		<h1 class="topic">{activePlanItem?.title || lesson.topic}</h1>
-		{#if activePlanItem?.angle}
-			<p class="lede">{activePlanItem.angle}</p>
+
+		{#if stillWriting}
+			<p class="working shimmering">Still writing this episode</p>
 		{/if}
 
-		{#if visibleBlocks.length}
+		{#if lesson.errorMessage}
+			<p class="itemerror">{lesson.errorMessage}</p>
+		{/if}
+
+		{#if lesson.blocks.length}
 			<div class="transport">
 				{#if playback.playing}
 					<button class="ghost" onclick={stopPlayback}>◼ Stop</button>
 				{:else if firstBlockId}
-					<button class="ghost" onclick={() => playFrom(firstBlockId)}>▶ Play</button>
+					<button class="ghost" onclick={() => playFrom(firstBlockId)}>▶ Play episode</button>
 				{/if}
 				<span class="voicelabel">
 					{settings.speechProvider === 'speechify'
@@ -218,11 +184,9 @@
 					<span class="playerror">{playback.errorMessage}</span>
 				{/if}
 			</div>
-		{:else if lesson.running}
-			<p class="lede">This section has not been written yet. It will appear here as soon as it is.</p>
 		{/if}
 
-		{#each visibleBlocks as block (block.id)}
+		{#each lesson.blocks as block (block.id)}
 			<BlockView
 				{block}
 				onRequestActions={(target) => (sheetBlock = target)}
@@ -230,7 +194,9 @@
 			/>
 		{/each}
 
-		{#if lesson.finished && visibleBlocks.length}
+		{#if stillWriting}
+			<p class="working shimmering">Still writing this episode</p>
+		{:else if lesson.finished && lesson.blocks.length}
 			<p class="footnote">
 				Ask anything below, or put the cursor into any paragraph and type — your question becomes
 				part of the episode, and the answer lands right under it. Enter starts a new paragraph.
@@ -238,15 +204,38 @@
 		{/if}
 	</div>
 
-	{#if visibleBlocks.length}
+	{#if lesson.blocks.length}
 		<AskBar {anchorBlockId} />
 	{/if}
 	<BlockActions block={sheetBlock} onClose={() => (sheetBlock = null)} />
 {/if}
 
+{#if expandedWork}
+	<div
+		class="sheet"
+		role="dialog"
+		aria-modal="true"
+		aria-label="Reasoning"
+		tabindex="-1"
+		onclick={(event) => {
+			if (event.currentTarget === event.target) expandedWork = null;
+		}}
+		onkeydown={(event) => {
+			if (event.key === 'Escape') expandedWork = null;
+		}}
+	>
+		<div class="sheetpanel">
+			<div class="sheethead">
+				<h2>Reasoning</h2>
+				<button class="ghost tiny" onclick={() => (expandedWork = null)}>Close</button>
+			</div>
+			<ReasoningLog beats={expandedWork} running={stillWriting} />
+		</div>
+	</div>
+{/if}
+
 <style>
 	.library,
-	.topics,
 	.lesson {
 		padding-bottom: 40px;
 	}
@@ -317,67 +306,47 @@
 		border-radius: 12px;
 		padding: 12px 14px;
 	}
-	.cards {
+
+	.entries {
 		list-style: none;
-		margin: 0;
+		margin: 8px 0 0;
 		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
 	}
-	.card {
+	.entries > li {
+		padding: 18px 0 20px;
+		border-top: 1px solid var(--rule);
+	}
+	.entry {
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
 		width: 100%;
 		text-align: left;
-		padding: 16px 16px 14px;
-		border: 1.5px solid var(--line);
-		border-radius: 16px;
-		background: var(--panel);
+		padding: 0;
+		background: none;
+		border: none;
 	}
-	.card h2 {
+	.entry h2 {
 		font-family: var(--serif);
-		font-size: 18px;
-		line-height: 1.35;
+		font-size: 22px;
+		line-height: 1.3;
 		margin: 0;
 		font-weight: 600;
 	}
-	.cardmeta {
+	.meta {
 		display: flex;
-		gap: 10px;
+		gap: 12px;
 		margin: 0;
 		font-size: 12px;
 		color: var(--muted);
 		text-transform: uppercase;
 		letter-spacing: 0.06em;
 	}
-	.cardactivity,
-	.cardplan {
-		margin: 0;
-		padding: 0;
-		list-style: none;
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-	}
-	.cardactivity li,
-	.cardplan li,
-	.carderror {
+	.itemerror {
+		margin: 8px 0 0;
 		font-size: 13px;
-		color: var(--muted);
-		line-height: 1.4;
-	}
-	.cardplan {
-		list-style: decimal;
-		padding-left: 18px;
-	}
-	.cardplan li.done {
-		color: var(--ok);
-	}
-	.carderror {
 		color: var(--bad);
-		margin: 0;
+		line-height: 1.5;
 	}
 
 	.back {
@@ -386,72 +355,16 @@
 		margin: 0 0 12px;
 		padding: 0;
 	}
-	.topiclist {
-		list-style: none;
-		margin: 18px 0 0;
-		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-	.topicrow {
-		display: flex;
-		gap: 12px;
-		align-items: flex-start;
-		width: 100%;
-		text-align: left;
-		padding: 14px 14px;
-		border: 1.5px solid var(--line);
-		border-radius: 14px;
-		background: var(--panel);
-	}
-	.tmark {
-		width: 9px;
-		height: 9px;
-		margin-top: 6px;
-		border-radius: 50%;
-		border: 1.5px solid var(--line);
-		flex: 0 0 9px;
-	}
-	.tmark.done {
-		background: var(--ok);
-		border-color: var(--ok);
-	}
-	.tbody {
-		display: flex;
-		flex-direction: column;
-		gap: 4px;
-		flex: 1;
-		min-width: 0;
-	}
-	.ttitle {
-		font-size: 16px;
-		line-height: 1.35;
-	}
-	.tangle {
+	.working {
+		margin: 0 0 18px;
 		font-size: 13px;
-		color: var(--muted);
-		line-height: 1.45;
+		letter-spacing: 0.04em;
 	}
-	.tstat {
-		font-size: 11px;
-		color: var(--muted);
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
-		margin-top: 4px;
-	}
-	.railerror {
-		margin: 8px 0 0;
-		font-size: 13px;
-		color: var(--bad);
-		line-height: 1.5;
-	}
-
 	.transport {
 		display: flex;
 		align-items: center;
 		gap: 10px;
-		margin: 18px 0 22px;
+		margin-bottom: 22px;
 		flex-wrap: wrap;
 	}
 	.ghost {
@@ -459,6 +372,11 @@
 		border-radius: 999px;
 		border: 1.5px solid var(--line);
 		font-size: 14px;
+	}
+	.ghost.tiny {
+		padding: 3px 9px;
+		font-size: 11px;
+		border-radius: 999px;
 	}
 	.voicelabel {
 		font-size: 12px;
@@ -473,7 +391,37 @@
 		font-size: 13px;
 		line-height: 1.55;
 		color: var(--muted);
-		border-top: 1px solid var(--line);
+		border-top: 1px solid var(--rule);
 		padding-top: 14px;
+	}
+
+	.sheet {
+		position: fixed;
+		inset: 0;
+		z-index: 40;
+		background: color-mix(in srgb, var(--bg) 72%, transparent);
+		display: flex;
+		align-items: flex-end;
+		justify-content: center;
+		padding: 16px 16px calc(16px + var(--safe-bottom));
+	}
+	.sheetpanel {
+		width: min(34rem, 100%);
+		max-height: min(78vh, 640px);
+		overflow: auto;
+		background: var(--bg);
+		border-top: 1px solid var(--rule);
+		padding: 16px 4px 24px;
+	}
+	.sheethead {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		margin-bottom: 12px;
+	}
+	.sheethead h2 {
+		margin: 0;
+		font-family: var(--serif);
+		font-size: 22px;
 	}
 </style>

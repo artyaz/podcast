@@ -223,6 +223,17 @@ def _emit(event: Dict[str, Any]) -> None:
         writer(event)
 
 
+def _work(title: str, reasoning: str) -> None:
+    """A beat the library shows: a short job name, then a sentence of thinking."""
+    _emit(
+        {
+            "type": "work",
+            "title": title,
+            "reasoning": reasoning,
+        }
+    )
+
+
 def _suspend(state_phase: str, reason: str) -> Dict[str, Any]:
     _emit({"type": "suspend", "phase": state_phase, "reason": reason})
     return {"suspended": True, "suspend_reason": reason, "phase": state_phase}
@@ -361,6 +372,10 @@ def scope_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
         return _suspend("scope", "not enough time to scope the question")
 
     _emit({"type": "phase", "phase": "scope", "message": "Splitting the question apart"})
+    _work(
+        "Splitting the question apart",
+        "I am restating what this episode actually has to settle, and which parts are facts, concepts, or values.",
+    )
     scoping_result = chat_json(
         vault,
         messages=[
@@ -422,6 +437,10 @@ def brainstorm_node(state: ResearchState, config: RunnableConfig) -> Dict[str, A
             "message": "Pressure-testing the episode before planning it",
         }
     )
+    _work(
+        "Pressure-testing the episode",
+        "I am naming the tensions and the documents this episode is worthless without, before any prose is written.",
+    )
     try:
         result = chat_json(
             vault,
@@ -476,6 +495,10 @@ def plan_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]:
 
     existing_subtopics = state.get("subtopics") or []
     _emit({"type": "phase", "phase": "plan", "message": "Writing the episode plan"})
+    _work(
+        "Deciding what to write, and in what order",
+        "I am turning the research agenda into a private writing queue so each turn covers one stretch of a single episode.",
+    )
 
     if existing_subtopics:
         seeded = plan_from_subtopics(existing_subtopics)
@@ -546,6 +569,10 @@ def research_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any
             "round": round_number,
         }
     )
+    _work(
+        "Research round {0}".format(round_number),
+        "I am working the open questions against primary sources, and I will not write the episode until the findings can carry it.",
+    )
 
     conversation = [
         {"role": "system", "content": lesson_research_system_prompt()},
@@ -578,16 +605,31 @@ def research_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any
             arguments = loop_event.get("arguments") or {}
             if loop_event.get("tool") == "exa_search":
                 searches_performed += 1
+                query = arguments.get("query") or ""
                 _emit(
                     {
                         "type": "search",
-                        "query": arguments.get("query") or "",
+                        "query": query,
                         "mode": arguments.get("mode") or "auto",
                     }
                 )
+                _work(
+                    "Searching the record",
+                    "I am looking for {0}.".format(query or "the next piece of evidence"),
+                )
             elif loop_event.get("tool") == "firecrawl_scrape":
                 pages_read += 1
-                _emit({"type": "read", "url": arguments.get("url") or ""})
+                page_url = arguments.get("url") or ""
+                _emit({"type": "read", "url": page_url})
+                host = ""
+                if "//" in page_url:
+                    host = page_url.split("//", 1)[1].split("/", 1)[0]
+                _work(
+                    "Reading a source in full",
+                    "I am going through {0} properly, because a search snippet strips the qualifications.".format(
+                        host or page_url or "this page"
+                    ),
+                )
         elif event_type == "tool_result":
             tool_result = loop_event.get("result") or {}
             if tool_result.get("error"):
@@ -624,6 +666,10 @@ def research_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any
         # findings, which then lets the writing step mark recalled claims
         # "verified" because nothing contradicts them.
         _emit({"type": "phase", "phase": "research", "message": "Writing up what was found"})
+        _work(
+            "Writing up what was found",
+            "The search loop has to stop so I can turn the retrieved sources into claims before the clock runs out.",
+        )
         conversation.append(
             {
                 "role": "user",
@@ -679,6 +725,10 @@ def distill_node(state: ResearchState, config: RunnableConfig) -> Dict[str, Any]
         return {"phase": "gap_check", "briefing": "", "suspended": False}
 
     _emit({"type": "phase", "phase": "distill", "message": "Marking claim status"})
+    _work(
+        "Marking what is actually established",
+        "I am sorting each claim into verified, contested, inferred, or still unverified, and dropping anything I cannot source.",
+    )
     try:
         distilled = chat_json(
             vault,
@@ -739,6 +789,10 @@ def gap_check_node(state: ResearchState, config: RunnableConfig) -> Dict[str, An
     maximum_rounds = int(state.get("maximum_rounds") or DEFAULT_MAXIMUM_ROUNDS)
 
     _emit({"type": "phase", "phase": "gap_check", "message": "Auditing what is missing"})
+    _work(
+        "Auditing what is still missing",
+        "I am checking whether the findings can carry an episode, or whether another research round is required.",
+    )
     try:
         audit = chat_json(
             vault,
@@ -832,6 +886,10 @@ def revise_plan_node(state: ResearchState, config: RunnableConfig) -> Dict[str, 
         return {"phase": "gap_check", "suspended": False}
 
     _emit({"type": "phase", "phase": "revise_plan", "message": "Editing the plan against the findings"})
+    _work(
+        "Revising the writing queue",
+        "I am editing individual lines of the plan against what the sources actually established, not rewriting the whole thing.",
+    )
     try:
         result = chat_json(
             vault,
@@ -894,11 +952,17 @@ def write_section_node(state: ResearchState, config: RunnableConfig) -> Dict[str
         {
             "type": "phase",
             "phase": "write_section",
-            "message": "Writing: {0}".format(section.get("title") or "section"),
+            "message": "Writing: {0}".format(section.get("title") or "the next stretch"),
             "section_id": section.get("id"),
             "section_index": section_index,
             "section_count": len(plan),
         }
+    )
+    _work(
+        "Writing the next stretch",
+        "I am appending the next passage of the episode, covering {0}.".format(
+            section.get("title") or "what the plan says comes next"
+        ),
     )
 
     findings = state.get("findings") or []

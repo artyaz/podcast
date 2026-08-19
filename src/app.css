@@ -14,6 +14,7 @@
 	/* Reading measure for spoken prose: one block is one breath, so the column
 	   stays narrow enough that a paragraph reads as a single unit. */
 	--measure: 34rem;
+	--rule: color-mix(in srgb, var(--muted) 32%, transparent);
 }
 
 @media (prefers-color-scheme: dark) {

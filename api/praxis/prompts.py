@@ -413,13 +413,16 @@ def section_writing_prompt(
     previous_titles: str,
     target_block_count: int,
 ) -> str:
-    return """Write one section of the lesson, not the whole lesson.
+    return """Write the next stretch of a single continuous episode. It will be
+appended to what is already written. This is not a new document and not a
+separate chapter the listener has to click into.
 
 Topic: {0}
-This is section {1} of {2}: {3}
-What this section must establish: {4}
+This stretch covers: {3}
+What it must establish: {4}
+This is stretch {1} of about {2} in the private writing queue.
 
-Sections already written (do not recap them):
+Already on the page (do not recap it):
 {5}
 
 How the question was scoped:

@@ -49,6 +49,11 @@ export interface ResearchActivity {
 	detail?: string;
 }
 
+export interface WorkBeat {
+	title: string;
+	reasoning: string;
+}
+
 interface LessonState {
 	topic: string;
 	/** The chosen episode spine, empty when the topic was researched freely. */
@@ -63,6 +68,7 @@ interface LessonState {
 	phase: string;
 	slicesUsed: number;
 	activity: ResearchActivity[];
+	work: WorkBeat[];
 	errorMessage: string;
 }
 
@@ -77,6 +83,7 @@ export const lesson = $state<LessonState>({
 	phase: '',
 	slicesUsed: 0,
 	activity: [],
+	work: [],
 	errorMessage: ''
 });
 
@@ -215,6 +222,13 @@ function absorbResearchEvent(event: Record<string, unknown>): void {
 			text: 'Brainstorm',
 			detail: tensions.slice(0, 4).join('\n')
 		});
+	} else if (eventType === 'work') {
+		const title = ((event.title as string) || '').trim();
+		const reasoning = ((event.reasoning as string) || '').trim();
+		if (title || reasoning) {
+			lesson.work.push({ title: title || 'Working', reasoning });
+			touch();
+		}
 	} else if (eventType === 'blocks_delta') {
 		const incoming = ((event.blocks as Block[]) || []).map((block) => ({
 			...block,
@@ -244,6 +258,7 @@ export async function runResearch(
 	lesson.finished = false;
 	lesson.errorMessage = '';
 	lesson.activity = [];
+	lesson.work = [];
 	lesson.slicesUsed = 0;
 	touch();
 
