@@ -66,7 +66,8 @@ class SpeechModelSlugTests(unittest.TestCase):
     def test_catalog_slug_stays_first(self):
         candidates = _speech_model_candidates("hexgrad/kokoro-82m")
         self.assertEqual(candidates[0], "hexgrad/kokoro-82m")
-        self.assertIn("deepinfra/hexgrad/kokoro-82m", candidates)
+        self.assertFalse(any(item.startswith("together/") for item in candidates))
+        self.assertFalse(any(item.startswith("deepinfra/") for item in candidates))
 
 
 class AudioFormatTests(unittest.TestCase):

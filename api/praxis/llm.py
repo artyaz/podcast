@@ -37,20 +37,20 @@ DEFAULT_CHAT_MODEL = "~deepseek/deepseek-v4-flash-latest"
 DEFAULT_TRANSCRIBE_MODEL = "openai/whisper-large-v3-turbo"
 DEFAULT_KOKORO_MODEL = "hexgrad/kokoro-82m"
 
-# OpenRouter's /audio/speech validator says "Use format: provider/model" and has
-# been observed rejecting `hexgrad/kokoro-82m` even though that is the catalog
-# id. hexgrad is the HuggingFace org; DeepInfra/Together are the providers.
-# Try the catalog slug first, then the provider-qualified forms.
-KOKORO_MODEL_CANDIDATES = (
-    "hexgrad/kokoro-82m",
-    "deepinfra/hexgrad/kokoro-82m",
-    "together/hexgrad/kokoro-82m",
-)
+# Use the catalog slug only. Prefixing Together/DeepInfra (`together/hexgrad/...`)
+# or sending provider.order pins a provider OpenRouter then tries as BYOK —
+# which this app does not have. Kokoro is billed through OpenRouter on DeepInfra;
+# Whisper Large is billed through OpenRouter on DeepInfra and Groq. Whisper-1
+# exists only on OpenAI and will 400 with "No credentials for provider: openai".
+KOKORO_MODEL_CANDIDATES = ("hexgrad/kokoro-82m",)
 TRANSCRIBE_MODEL_CANDIDATES = (
     "openai/whisper-large-v3-turbo",
     "openai/whisper-large-v3",
-    "openai/whisper-1",
 )
+
+# Providers that only work if the OpenRouter workspace has a BYOK key for them.
+# Ignore them so routing stays on OpenRouter's own credit pool.
+OPENROUTER_SKIP_BYOK_PROVIDERS = ("openai", "together")
 
 # Reasoning off by default. The default model reports mandatory=false with
 # default_enabled=true, so leaving the parameter out would silently turn reasoning
@@ -703,10 +703,16 @@ def transcribe_audio(
                             "data": encoded_audio,
                             "format": audio_format,
                         },
+                        "provider": {
+                            "ignore": list(OPENROUTER_SKIP_BYOK_PROVIDERS)
+                        },
                     },
                     timeout_seconds=90.0,
                 )
             except ProviderHttpError as http_error:
+                body = (http_error.body_text or "").lower()
+                if "no credentials" in body:
+                    raise
                 if http_error.status_code not in (400, 415, 422):
                     raise
                 response_body = post_multipart_for_json(
@@ -768,7 +774,9 @@ def synthesize_speech_kokoro(
                     "input": text,
                     "voice": voice_identifier,
                     "response_format": "mp3",
-                    "provider": {"order": ["DeepInfra", "Together"]},
+                    "provider": {
+                        "ignore": list(OPENROUTER_SKIP_BYOK_PROVIDERS)
+                    },
                 },
             )
             result = {
