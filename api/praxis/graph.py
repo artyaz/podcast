@@ -55,7 +55,13 @@ NODE_TIME_REQUIREMENTS = {
     "research": 100,
     "distill": 45,
     "gap_check": 35,
-    "write": 90,
+    # Writing an episode is the longest single model turn in the graph — it emits
+    # thousands of tokens in one call. A measured run started it with time that
+    # looked sufficient and still crossed 300s of wall clock and got killed. The
+    # requirement is therefore set close to a whole pass, so that in practice
+    # writing suspends and claims a fresh invocation to itself rather than
+    # squeezing into whatever is left over after research.
+    "write": 170,
 }
 
 DEFAULT_MINIMUM_ROUNDS = 2
