@@ -149,16 +149,27 @@ The frontend is prerendered and talks to the backend over `fetch`, so either top
 
 Two things about this layout are load-bearing, and both were learned by breaking them.
 
-**`requirements.txt` stays in `api/`, beside the function — not at the project root.** Moving it to the root looks tidier and breaks the build outright:
+**`requirements.txt` stays in `api/`, beside the function.** That is where the Python builder reads it from for a file-based function, and it is installed correctly there. Moving it to the project root is worse than pointless: a root `requirements.txt` naming FastAPI is what Vercel's Python *framework* detection matches on, and a Python framework preset takes precedence over file-based functions.
+
+**`api/index.py` must bind `app` at the top level of the module.** Vercel decides whether a file in `api/` is a function by looking for a top-level `app`, `application` or `handler`. A binding that exists only inside a `try`/`except` body is not top-level, and a file without one is not a function at all:
 
 ```
 Error: The pattern "api/index.py" defined in `functions` doesn't match
 any Serverless Functions inside the `api` directory.
 ```
 
-A root `requirements.txt` naming FastAPI is exactly what Vercel's Python framework detection matches on, and a Python framework preset takes precedence over file-based functions — so `api/index.py` stops being a function and the pattern matches nothing. Pinning `framework: "sveltekit"` does not rescue it. Keeping the requirements file next to the function keeps this a SvelteKit project that happens to contain one Python function, which is what it is.
+That is what a guarded import written the obvious way produces:
 
-**`api/index.py` puts its own directory on `sys.path`** before importing `praxis`, because functions run with the project root as the working directory, so a bare `import praxis` is not guaranteed to resolve.
+```python
+try:
+    from praxis.api import app          # not top-level
+except Exception:
+    async def app(scope, receive, send): ...   # also not top-level
+```
+
+Parsing that and listing only the module's direct children returns nothing. So the guarded import writes to a private name and the module ends with a plain unconditional assignment, `app = _loaded_app if _loaded_app is not None else _diagnostic_app`, which no detector can miss.
+
+**`api/index.py` puts its own directory on `sys.path`** before importing `praxis`. This was the actual cause of the first deployment's `FUNCTION_INVOCATION_FAILED`: functions run with the project root as the working directory, so `from praxis.graph import ...` raised `ModuleNotFoundError` and killed the module before it could serve anything. Dependencies were installed the whole time; the package simply was not importable.
 
 If the function fails to import anyway, `/api/health` answers with the traceback, the Python version, the working directory, `sys.path`, and the list of packages that actually got installed — rather than the blank 500 that Vercel returns for an import-time crash. That diagnostic is the entire reason the entrypoint is a thin loader: from outside a deployment, a missing dependency, a wrong runtime version and a real bug are otherwise indistinguishable.
 
