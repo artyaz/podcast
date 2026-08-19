@@ -145,15 +145,22 @@ The frontend is prerendered and talks to the backend over `fetch`, so either top
 
 ### One project (default)
 
-`vercel.json` maps every `/api/*` request into the ASGI app at `api/index.py`, which routes internally, and pins `framework: "sveltekit"`. Leave **Backend URL** empty in Settings.
+`vercel.json` maps every `/api/*` request into the ASGI app at `api/index.py`, which routes internally. Leave **Backend URL** empty in Settings.
 
-Three details that a first deployment gets wrong:
+Two things about this layout are load-bearing, and both were learned by breaking them.
 
-- **`requirements.txt` belongs at the project root**, not in `api/`. The build installs Python dependencies from the root, so a copy inside `api/` is never read — the function then dies importing FastAPI and returns `FUNCTION_INVOCATION_FAILED` with an empty body.
-- **The framework has to be pinned.** A root `requirements.txt` containing FastAPI is exactly what Vercel's Python framework detection looks for, and a Python preset takes precedence over file-based functions — which would hand the whole domain to the backend and break the frontend. `framework: "sveltekit"` in `vercel.json` settles it.
-- **`api/index.py` puts its own directory on `sys.path`** before importing `praxis`, because functions run with the project root as the working directory, so a bare `import praxis` is not guaranteed to resolve.
+**`requirements.txt` stays in `api/`, beside the function — not at the project root.** Moving it to the root looks tidier and breaks the build outright:
 
-If the function still fails to import, `/api/health` answers with the traceback, the Python version, `sys.path`, and the list of packages that actually got installed, rather than a blank 500. That diagnostic is the point of the thin entrypoint: a serverless import error is otherwise invisible from outside the deployment.
+```
+Error: The pattern "api/index.py" defined in `functions` doesn't match
+any Serverless Functions inside the `api` directory.
+```
+
+A root `requirements.txt` naming FastAPI is exactly what Vercel's Python framework detection matches on, and a Python framework preset takes precedence over file-based functions — so `api/index.py` stops being a function and the pattern matches nothing. Pinning `framework: "sveltekit"` does not rescue it. Keeping the requirements file next to the function keeps this a SvelteKit project that happens to contain one Python function, which is what it is.
+
+**`api/index.py` puts its own directory on `sys.path`** before importing `praxis`, because functions run with the project root as the working directory, so a bare `import praxis` is not guaranteed to resolve.
+
+If the function fails to import anyway, `/api/health` answers with the traceback, the Python version, the working directory, `sys.path`, and the list of packages that actually got installed — rather than the blank 500 that Vercel returns for an import-time crash. That diagnostic is the entire reason the entrypoint is a thin loader: from outside a deployment, a missing dependency, a wrong runtime version and a real bug are otherwise indistinguishable.
 
 Python functions get a 500 MB uncompressed bundle (Node gets 250 MB), which LangGraph fits inside comfortably. Billing is on active CPU, and a research loop is almost entirely I/O wait, so waiting on Exa and the model is not billed.
 
