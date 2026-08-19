@@ -48,11 +48,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Hobby terminates an invocation at 300 seconds. The graph is given 240 so it has
-# time to notice it is nearly out of clock, suspend cleanly, and get the
-# checkpoint into the response body before the platform pulls the plug.
-DEFAULT_RESEARCH_BUDGET_SECONDS = 240.0
-HARD_BUDGET_CEILING_SECONDS = 280.0
+# Hobby terminates an invocation at 300 seconds, and the budget is not the whole
+# story: a research round that gets cut off still spends one more turn writing up
+# what it found, and that turn was measured overrunning the budget by about 30
+# seconds. So the default leaves room for the overrun plus the response itself.
+# A 240 budget was observed finishing at 272s, which is closer to the wall than
+# anything should be.
+DEFAULT_RESEARCH_BUDGET_SECONDS = 200.0
+HARD_BUDGET_CEILING_SECONDS = 240.0
 
 
 def _server_sent_event(event_payload: Dict[str, Any]) -> str:

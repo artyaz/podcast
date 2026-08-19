@@ -41,8 +41,9 @@ export interface Settings {
 	targetBlockCount: number;
 
 	/**
-	 * Seconds granted per invocation. Hobby kills a function at 300s, so the
-	 * default leaves headroom for the graph to suspend and return its state.
+	 * Seconds granted per invocation. Hobby kills a function at 300s, and a round
+	 * that gets cut off still spends a turn writing up what it found — measured
+	 * overrunning by roughly 30 seconds. 200 leaves room for that plus the response.
 	 */
 	budgetSeconds: number;
 
@@ -67,7 +68,7 @@ const emptySettings: Settings = {
 	minimumRounds: 2,
 	maximumRounds: 5,
 	targetBlockCount: 12,
-	budgetSeconds: 240,
+	budgetSeconds: 200,
 	backendBaseUrl: ''
 };
 

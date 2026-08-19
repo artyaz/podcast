@@ -293,12 +293,14 @@
 		</label>
 		<label>
 			<span>Seconds per pass</span>
-			<input type="number" min="30" max="280" bind:value={settings.budgetSeconds} onchange={save} />
+			<input type="number" min="30" max="240" bind:value={settings.budgetSeconds} onchange={save} />
 		</label>
 		<p class="hint">
 			Vercel's Hobby plan kills any request at 300 seconds, so research runs in passes: the graph
 			stops just short of the limit, hands back its state, and the next pass picks up where it left
-			off. Leave this at 240 unless you are on Pro, where 800 is available.
+			off. A cut-off round still spends one turn writing up what it found, which was measured
+			overrunning by about 30 seconds — so 200 leaves headroom under the 300 second wall. Raise it
+			only on Pro, where the ceiling is 800.
 		</p>
 	</section>
 
