@@ -1,10 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "sveltekit",
   "functions": {
     "api/index.py": {
       "maxDuration": 300,
       "memory": 2048,
-      "excludeFiles": "{**/__pycache__/**,**/*.pyc,scripts/**,src/**,static/**,node_modules/**}"
+      "excludeFiles": "{**/__pycache__/**,**/*.pyc,src/**,static/**,node_modules/**,.svelte-kit/**}"
     }
   },
   "rewrites": [

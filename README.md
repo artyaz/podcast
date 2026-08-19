@@ -145,7 +145,15 @@ The frontend is prerendered and talks to the backend over `fetch`, so either top
 
 ### One project (default)
 
-`vercel.json` maps every `/api/*` request into the ASGI app at `api/index.py`, which routes internally. Deploy the repo as a single Vercel project with the SvelteKit preset; the Python function is built from `api/requirements.txt`. Leave **Backend URL** empty in Settings.
+`vercel.json` maps every `/api/*` request into the ASGI app at `api/index.py`, which routes internally, and pins `framework: "sveltekit"`. Leave **Backend URL** empty in Settings.
+
+Three details that a first deployment gets wrong:
+
+- **`requirements.txt` belongs at the project root**, not in `api/`. The build installs Python dependencies from the root, so a copy inside `api/` is never read — the function then dies importing FastAPI and returns `FUNCTION_INVOCATION_FAILED` with an empty body.
+- **The framework has to be pinned.** A root `requirements.txt` containing FastAPI is exactly what Vercel's Python framework detection looks for, and a Python preset takes precedence over file-based functions — which would hand the whole domain to the backend and break the frontend. `framework: "sveltekit"` in `vercel.json` settles it.
+- **`api/index.py` puts its own directory on `sys.path`** before importing `praxis`, because functions run with the project root as the working directory, so a bare `import praxis` is not guaranteed to resolve.
+
+If the function still fails to import, `/api/health` answers with the traceback, the Python version, `sys.path`, and the list of packages that actually got installed, rather than a blank 500. That diagnostic is the point of the thin entrypoint: a serverless import error is otherwise invisible from outside the deployment.
 
 Python functions get a 500 MB uncompressed bundle (Node gets 250 MB), which LangGraph fits inside comfortably. Billing is on active CPU, and a research loop is almost entirely I/O wait, so waiting on Exa and the model is not billed.
 
@@ -165,9 +173,8 @@ Vercel also supports one project with a SvelteKit service at `/` and a Python se
 npm install
 npm run dev                     # frontend on :5173, proxies /api
 
-cd api
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m uvicorn index:app --port 8000
+cd api && ../.venv/bin/python -m uvicorn index:app --port 8000
 ```
 
 Set `PRAXIS_BACKEND_URL` if the backend is not on `http://127.0.0.1:8000`.
