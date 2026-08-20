@@ -130,6 +130,8 @@
 
 	let testMessage = $state('');
 	let testing = $state(false);
+	let audioCheckMessage = $state('');
+	let checkingAudio = $state(false);
 
 	let exported = $state('');
 	let importDraft = $state('');
@@ -214,6 +216,42 @@
 			testMessage = `✗ ${(failure as Error).message}`;
 		} finally {
 			testing = false;
+		}
+	}
+
+	async function testAudio() {
+		checkingAudio = true;
+		audioCheckMessage = '';
+		try {
+			const response = await fetch(backendUrl('/api/audiocheck'), {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ secrets: secretsPayload(), llm: llmPayload() })
+			});
+			if (!response.ok) {
+				let detail = `HTTP ${response.status}`;
+				try {
+					detail = (await response.json()).detail || detail;
+				} catch {
+					/* keep the status line */
+				}
+				throw new Error(detail);
+			}
+			const payload = await response.json();
+			absorbUsage(payload.usage);
+			const speech = payload.speech || {};
+			const transcription = payload.transcription || {};
+			const speechLine = speech.ok
+				? `speech ${speech.model} (${speech.bytes} bytes)`
+				: `speech failed: ${speech.detail || 'unknown'}`;
+			const transLine = transcription.ok
+				? `transcription ok`
+				: `transcription failed: ${transcription.detail || 'unknown'}`;
+			audioCheckMessage = `${speech.ok ? '✓' : '✗'} ${speechLine}\n${transcription.ok ? '✓' : '✗'} ${transLine}`;
+		} catch (failure) {
+			audioCheckMessage = `✗ ${(failure as Error).message}`;
+		} finally {
+			checkingAudio = false;
 		}
 	}
 
@@ -695,8 +733,16 @@
 			<button class="ghost" onclick={checkKeys} disabled={checkingKeys}>
 				{checkingKeys ? 'Checking keys…' : 'Check every key'}
 			</button>
+			<button class="ghost" onclick={testAudio} disabled={checkingAudio}>
+				{checkingAudio ? 'Testing speech…' : 'Test speech and mic'}
+			</button>
 		</div>
 		{#if testMessage}<p class="status" class:ok={testMessage.startsWith('✓')}>{testMessage}</p>{/if}
+		{#if audioCheckMessage}
+			<p class="status" class:ok={audioCheckMessage.startsWith('✓')} style="white-space: pre-wrap">
+				{audioCheckMessage}
+			</p>
+		{/if}
 		{#if keyCheckMessage}<p class="status">{keyCheckMessage}</p>{/if}
 
 		{#if Object.keys(keyReport).length}

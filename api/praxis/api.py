@@ -46,6 +46,7 @@ from .llm import (
     LlmProfile,
     list_chat_models,
     list_speechify_voices,
+    probe_openrouter_audio,
     synthesize_speech_kokoro,
     synthesize_speech_speechify,
     transcribe_audio,
@@ -237,6 +238,20 @@ async def keycheck(request: Request) -> Dict[str, Any]:
         report[provider_name] = rows
 
     return {"results": report, "usage": vault.export_usage()}
+
+
+@app.post("/api/audiocheck")
+async def audiocheck(request: Request) -> Dict[str, Any]:
+    """Hit speech and transcription for real, on this OpenRouter key."""
+    request_body = await request.json()
+    vault = _build_vault(request_body)
+    _require_providers(vault, ["openrouter"])
+    try:
+        report = probe_openrouter_audio(vault, _build_profile(request_body))
+    except KeyExhausted as exhausted:
+        raise HTTPException(status_code=402, detail=str(exhausted))
+    report["usage"] = vault.export_usage()
+    return report
 
 
 @app.post("/api/models")

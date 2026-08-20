@@ -37,20 +37,62 @@ DEFAULT_CHAT_MODEL = "~deepseek/deepseek-v4-flash-latest"
 DEFAULT_TRANSCRIBE_MODEL = "openai/whisper-large-v3-turbo"
 DEFAULT_KOKORO_MODEL = "hexgrad/kokoro-82m"
 
-# Use the catalog slug only. Prefixing Together/DeepInfra (`together/hexgrad/...`)
-# or sending provider.order pins a provider OpenRouter then tries as BYOK —
-# which this app does not have. Kokoro is billed through OpenRouter on DeepInfra;
-# Whisper Large is billed through OpenRouter on DeepInfra and Groq. Whisper-1
-# exists only on OpenAI and will 400 with "No credentials for provider: openai".
-KOKORO_MODEL_CANDIDATES = ("hexgrad/kokoro-82m",)
+# OpenRouter's /audio/speech adapter list is not the same as the model catalogue.
+# `hexgrad/kokoro-82m` is in the catalogue (hosted by DeepInfra) but the speech
+# endpoint rejects it as "Invalid speech model" because `hexgrad` is the HF org,
+# not an inference provider. Prefixing the DeepInfra provider is the format the
+# endpoint asks for. Together is omitted — that slug 400s with
+# "No credentials for provider: together" unless BYOK is set.
+#
+# Whisper `openai/whisper-1` only exists on OpenAI. Whisper Large Turbo/V3 are
+# on DeepInfra and Groq, billed through OpenRouter credits. Pin `only` to those
+# so the `openai/` org in the slug does not send the request to OpenAI BYOK.
+KOKORO_MODEL_CANDIDATES = (
+    "deepinfra/hexgrad/kokoro-82m",
+    "hexgrad/kokoro-82m",
+)
 TRANSCRIBE_MODEL_CANDIDATES = (
     "openai/whisper-large-v3-turbo",
     "openai/whisper-large-v3",
+    "qwen/qwen3-asr-flash-2026-02-10",
 )
 
-# Providers that only work if the OpenRouter workspace has a BYOK key for them.
-# Ignore them so routing stays on OpenRouter's own credit pool.
-OPENROUTER_SKIP_BYOK_PROVIDERS = ("openai", "together")
+SPEECH_ATTEMPTS = (
+    {
+        "model": "deepinfra/hexgrad/kokoro-82m",
+        "only": ["deepinfra"],
+        "kind": "kokoro",
+    },
+    {
+        "model": "hexgrad/kokoro-82m",
+        "only": ["deepinfra"],
+        "kind": "kokoro",
+    },
+    {
+        "model": "mistralai/voxtral-mini-tts-2603",
+        "only": ["mistralai"],
+        "kind": "voxtral",
+    },
+    {
+        "model": "x-ai/grok-voice-tts-1.0",
+        "only": ["x-ai", "xai"],
+        "kind": "grok",
+    },
+)
+TRANSCRIBE_ATTEMPTS = (
+    {
+        "model": "openai/whisper-large-v3-turbo",
+        "only": ["deepinfra", "groq"],
+    },
+    {
+        "model": "openai/whisper-large-v3",
+        "only": ["deepinfra", "groq"],
+    },
+    {
+        "model": "qwen/qwen3-asr-flash-2026-02-10",
+        "only": ["alibaba"],
+    },
+)
 
 # Reasoning off by default. The default model reports mandatory=false with
 # default_enabled=true, so leaving the parameter out would silently turn reasoning
@@ -659,12 +701,60 @@ def _audio_format(filename: str, content_type: str) -> str:
     return "webm"
 
 
-def _transcribe_models(requested: str) -> List[str]:
+def _speech_model_candidates(requested: str) -> List[str]:
+    raw = (requested or DEFAULT_KOKORO_MODEL).strip()
     ordered: List[str] = []
-    for model_id in (requested, *TRANSCRIBE_MODEL_CANDIDATES):
-        if model_id and model_id not in ordered:
-            ordered.append(model_id)
+    if raw and "/" not in raw:
+        ordered.append("deepinfra/hexgrad/{0}".format(raw))
+        ordered.append("hexgrad/{0}".format(raw))
+    if raw:
+        ordered.append(raw)
+    for candidate in KOKORO_MODEL_CANDIDATES:
+        if candidate not in ordered:
+            ordered.append(candidate)
     return ordered
+
+
+def _voice_for_speech_model(kind: str, kokoro_voice: str) -> str:
+    if kind == "kokoro":
+        return kokoro_voice or "af_heart"
+    if kind == "voxtral":
+        if (kokoro_voice or "").startswith("bm"):
+            return "gb_oliver_neutral"
+        if (kokoro_voice or "").startswith("bf"):
+            return "gb_jane_neutral"
+        if (kokoro_voice or "").startswith("am"):
+            return "en_paul_neutral"
+        return "en_paul_neutral"
+    if (kokoro_voice or "").startswith("af"):
+        return "eve"
+    if (kokoro_voice or "").startswith("bf"):
+        return "ara"
+    if (kokoro_voice or "").startswith("am"):
+        return "rex"
+    return "leo"
+
+
+def _tiny_wav_bytes() -> bytes:
+    """0.2s of 16 kHz mono silence — enough for a transcription probe."""
+    sample_rate = 16000
+    sample_count = sample_rate // 5
+    data = b"\x00\x00" * sample_count
+    header = (
+        b"RIFF"
+        + (36 + len(data)).to_bytes(4, "little")
+        + b"WAVEfmt "
+        + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")
+        + (1).to_bytes(2, "little")
+        + sample_rate.to_bytes(4, "little")
+        + (sample_rate * 2).to_bytes(4, "little")
+        + (2).to_bytes(2, "little")
+        + (16).to_bytes(2, "little")
+        + b"data"
+        + len(data).to_bytes(4, "little")
+    )
+    return header + data
 
 
 def transcribe_audio(
@@ -676,10 +766,9 @@ def transcribe_audio(
 ) -> Dict[str, Any]:
     """Voice question in, text out.
 
-    OpenRouter's current transcriptions API wants JSON with base64
-    `input_audio`. Multipart is still accepted by OpenAI-compatible gateways, so
-    a 400/415 on the JSON path falls back to that. Either way the model slug
-    must be `provider/model` — `whisper-1` is rejected.
+    Always JSON `input_audio` plus `provider.only` for DeepInfra/Groq. Multipart
+    without `only` was routing `openai/whisper-*` to OpenAI and 400ing
+    "No credentials for provider: openai" on workspaces that are not BYOK.
     """
 
     profile = profile or LlmProfile()
@@ -687,41 +776,31 @@ def transcribe_audio(
     encoded_audio = base64.b64encode(audio_bytes).decode("ascii")
     last_error: Optional[ProviderHttpError] = None
 
-    for model_id in _transcribe_models(profile.transcribe_model):
-        def attempt(api_key: str, chosen_model: str = model_id):
-            headers = {
-                "Authorization": bearer_header(api_key),
-                "Content-Type": "application/json",
-            }
-            try:
-                response_body = post_json(
-                    profile.transcribe_url,
-                    headers=headers,
-                    payload={
-                        "model": chosen_model,
-                        "input_audio": {
-                            "data": encoded_audio,
-                            "format": audio_format,
-                        },
-                        "provider": {
-                            "ignore": list(OPENROUTER_SKIP_BYOK_PROVIDERS)
-                        },
+    attempts = list(TRANSCRIBE_ATTEMPTS)
+    requested = (profile.transcribe_model or "").strip()
+    if requested and requested not in [entry["model"] for entry in attempts]:
+        attempts.insert(
+            0, {"model": requested, "only": ["deepinfra", "groq", "alibaba"]}
+        )
+
+    for entry in attempts:
+        def attempt(api_key: str, chosen: Dict[str, Any] = entry):
+            response_body = post_json(
+                profile.transcribe_url,
+                headers={
+                    "Authorization": bearer_header(api_key),
+                    "Content-Type": "application/json",
+                },
+                payload={
+                    "model": chosen["model"],
+                    "input_audio": {
+                        "data": encoded_audio,
+                        "format": audio_format,
                     },
-                    timeout_seconds=90.0,
-                )
-            except ProviderHttpError as http_error:
-                body = (http_error.body_text or "").lower()
-                if "no credentials" in body:
-                    raise
-                if http_error.status_code not in (400, 415, 422):
-                    raise
-                response_body = post_multipart_for_json(
-                    profile.transcribe_url,
-                    headers={"Authorization": bearer_header(api_key)},
-                    files={"file": (filename, audio_bytes, content_type or "audio/webm")},
-                    data={"model": chosen_model},
-                    timeout_seconds=90.0,
-                )
+                    "provider": {"only": list(chosen["only"])},
+                },
+                timeout_seconds=90.0,
+            )
             reported_cost = float((response_body.get("usage") or {}).get("cost") or 0.0)
             return response_body, {"dollars": reported_cost}
 
@@ -738,31 +817,32 @@ def transcribe_audio(
     raise ProviderHttpError(502, "transcription returned no usable response")
 
 
-def _speech_model_candidates(requested: str) -> List[str]:
-    raw = (requested or DEFAULT_KOKORO_MODEL).strip()
-    ordered: List[str] = []
-    if raw and "/" not in raw:
-        ordered.append("hexgrad/{0}".format(raw))
-    if raw:
-        ordered.append(raw)
-    for candidate in KOKORO_MODEL_CANDIDATES:
-        if candidate not in ordered:
-            ordered.append(candidate)
-    return ordered
-
-
 def synthesize_speech_kokoro(
     vault: SecretVault,
     text: str,
     voice_identifier: str = "af_heart",
     profile: Optional[LlmProfile] = None,
 ) -> Dict[str, Any]:
-    """Kokoro answers with raw MP3 bytes and no timing information."""
+    """Speak one block. Tries Kokoro on DeepInfra, then OpenRouter speech adapters.
+
+    `/audio/speech` is not the model catalogue. It rejected `hexgrad/kokoro-82m`
+    with "Use format: provider/model" because hexgrad is the HuggingFace org.
+    DeepInfra is the billed provider, so the first attempt is
+    `deepinfra/hexgrad/kokoro-82m`. If that slug is also rejected, fall through
+    to Mistral Voxtral and Grok Voice — both are actual speech-endpoint adapters
+    that run on OpenRouter credits.
+    """
     profile = profile or LlmProfile()
     last_error: Optional[ProviderHttpError] = None
+    attempts = list(SPEECH_ATTEMPTS)
+    requested = (profile.speech_model or "").strip()
+    if requested and requested not in [entry["model"] for entry in attempts]:
+        attempts.insert(
+            0, {"model": requested, "only": ["deepinfra"], "kind": "kokoro"}
+        )
 
-    for model_id in _speech_model_candidates(profile.speech_model):
-        def attempt(api_key: str, chosen_model: str = model_id):
+    for entry in attempts:
+        def attempt(api_key: str, chosen: Dict[str, Any] = entry):
             audio_bytes, content_type = post_for_bytes(
                 profile.speech_url,
                 headers={
@@ -770,13 +850,13 @@ def synthesize_speech_kokoro(
                     "Content-Type": "application/json",
                 },
                 payload={
-                    "model": chosen_model,
+                    "model": chosen["model"],
                     "input": text,
-                    "voice": voice_identifier,
+                    "voice": _voice_for_speech_model(
+                        chosen["kind"], voice_identifier
+                    ),
                     "response_format": "mp3",
-                    "provider": {
-                        "ignore": list(OPENROUTER_SKIP_BYOK_PROVIDERS)
-                    },
+                    "provider": {"only": list(chosen["only"])},
                 },
             )
             result = {
@@ -784,6 +864,7 @@ def synthesize_speech_kokoro(
                 "content_type": content_type or "audio/mpeg",
                 "speech_marks": None,
                 "billable_characters": len(text),
+                "model": chosen["model"],
             }
             return result, {"characters": len(text)}
 
@@ -791,16 +872,48 @@ def synthesize_speech_kokoro(
             return run_with_rotation(vault.pool("openrouter"), attempt)
         except ProviderHttpError as http_error:
             last_error = http_error
-            body = (http_error.body_text or "").lower()
-            if http_error.status_code == 400 and (
-                "speech model" in body or "provider/model" in body
-            ):
+            if http_error.status_code == 400:
                 continue
             raise
 
     if last_error is not None:
         raise last_error
     raise ProviderHttpError(502, "speech returned no audio")
+
+
+def probe_openrouter_audio(
+    vault: SecretVault, profile: Optional[LlmProfile] = None
+) -> Dict[str, Any]:
+    """One real speech call and one real transcription call against this key."""
+    profile = profile or LlmProfile()
+    speech: Dict[str, Any] = {"ok": False}
+    transcription: Dict[str, Any] = {"ok": False}
+
+    try:
+        spoken = synthesize_speech_kokoro(
+            vault, text="ok", voice_identifier="af_heart", profile=profile
+        )
+        speech = {
+            "ok": True,
+            "model": spoken.get("model") or profile.speech_model,
+            "bytes": len(spoken.get("audio_bytes") or b""),
+        }
+    except ProviderHttpError as http_error:
+        speech = {"ok": False, "detail": http_error.diagnosis()[:320]}
+
+    try:
+        heard = transcribe_audio(
+            vault,
+            audio_bytes=_tiny_wav_bytes(),
+            filename="probe.wav",
+            content_type="audio/wav",
+            profile=profile,
+        )
+        transcription = {"ok": True, "text": (heard.get("text") or "")[:80]}
+    except ProviderHttpError as http_error:
+        transcription = {"ok": False, "detail": http_error.diagnosis()[:320]}
+
+    return {"speech": speech, "transcription": transcription}
 
 
 def _wrap_with_emotion(text: str, emotion: Optional[str]) -> str:

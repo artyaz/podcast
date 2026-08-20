@@ -60,14 +60,14 @@ class PlanPatchTests(unittest.TestCase):
 class SpeechModelSlugTests(unittest.TestCase):
     def test_bare_kokoro_id_gets_a_provider_prefix(self):
         candidates = _speech_model_candidates("kokoro-82m")
-        self.assertTrue(candidates[0].startswith("hexgrad/"))
+        self.assertEqual(candidates[0], "deepinfra/hexgrad/kokoro-82m")
         self.assertIn("hexgrad/kokoro-82m", candidates)
 
-    def test_catalog_slug_stays_first(self):
+    def test_catalog_slug_is_kept_and_deepinfra_is_offered(self):
         candidates = _speech_model_candidates("hexgrad/kokoro-82m")
         self.assertEqual(candidates[0], "hexgrad/kokoro-82m")
+        self.assertIn("deepinfra/hexgrad/kokoro-82m", candidates)
         self.assertFalse(any(item.startswith("together/") for item in candidates))
-        self.assertFalse(any(item.startswith("deepinfra/") for item in candidates))
 
 
 class AudioFormatTests(unittest.TestCase):
