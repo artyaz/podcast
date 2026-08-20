@@ -25,7 +25,6 @@ from .transport import (
     get_json,
     post_for_bytes,
     post_json,
-    post_multipart_for_json,
     run_with_rotation,
 )
 from .tools import TOOL_SCHEMAS, dispatch_tool_call
@@ -37,61 +36,38 @@ DEFAULT_CHAT_MODEL = "~deepseek/deepseek-v4-flash-latest"
 DEFAULT_TRANSCRIBE_MODEL = "openai/whisper-large-v3-turbo"
 DEFAULT_KOKORO_MODEL = "hexgrad/kokoro-82m"
 
-# OpenRouter's /audio/speech adapter list is not the same as the model catalogue.
-# `hexgrad/kokoro-82m` is in the catalogue (hosted by DeepInfra) but the speech
-# endpoint rejects it as "Invalid speech model" because `hexgrad` is the HF org,
-# not an inference provider. Prefixing the DeepInfra provider is the format the
-# endpoint asks for. Together is omitted — that slug 400s with
-# "No credentials for provider: together" unless BYOK is set.
+# Live POST /audio/speech against OpenRouter credits (2026-08-20):
+#   hexgrad/kokoro-82m + voice af_heart + response_format mp3  -> 200 MP3
+#   deepinfra/hexgrad/kokoro-82m                               -> 400 "does not exist"
+#   hexgrad/kokoro-82m with provider.only=["deepinfra"]        -> hangs, then 400
+#   x-ai/grok-voice-tts-1.0 with provider.only=["x-ai","xai"]  -> 400
+#     "Invalid speech model: x-ai/grok-voice-tts-1.0. Use format: provider/model"
+# The speech adapter wants the catalogue slug and nothing else. Do not send
+# provider.only and do not prefix a hosting provider onto the slug.
 #
-# Whisper `openai/whisper-1` only exists on OpenAI. Whisper Large Turbo/V3 are
-# on DeepInfra and Groq, billed through OpenRouter credits. Pin `only` to those
-# so the `openai/` org in the slug does not send the request to OpenAI BYOK.
-KOKORO_MODEL_CANDIDATES = (
-    "deepinfra/hexgrad/kokoro-82m",
-    "hexgrad/kokoro-82m",
-)
+# Transcription is JSON `input_audio` (base64 + format). Multipart 400s
+# "Invalid multipart form data" from this stack. Whisper Large Turbo/V3 and
+# Qwen ASR all 200 without a provider pin.
+KOKORO_MODEL_CANDIDATES = ("hexgrad/kokoro-82m",)
 TRANSCRIBE_MODEL_CANDIDATES = (
     "openai/whisper-large-v3-turbo",
     "openai/whisper-large-v3",
     "qwen/qwen3-asr-flash-2026-02-10",
 )
 
+# Grok Voice and Voxtral answer in under a second. Kokoro is in the catalogue
+# and 200s when the adapter is up, but it currently accepts the request and
+# never replies — putting it first costs 12s on every /api/speak. Keep it last.
 SPEECH_ATTEMPTS = (
-    {
-        "model": "deepinfra/hexgrad/kokoro-82m",
-        "only": ["deepinfra"],
-        "kind": "kokoro",
-    },
-    {
-        "model": "hexgrad/kokoro-82m",
-        "only": ["deepinfra"],
-        "kind": "kokoro",
-    },
-    {
-        "model": "mistralai/voxtral-mini-tts-2603",
-        "only": ["mistralai"],
-        "kind": "voxtral",
-    },
-    {
-        "model": "x-ai/grok-voice-tts-1.0",
-        "only": ["x-ai", "xai"],
-        "kind": "grok",
-    },
+    {"model": "x-ai/grok-voice-tts-1.0", "kind": "grok"},
+    {"model": "mistralai/voxtral-mini-tts-2603", "kind": "voxtral"},
+    {"model": "hexgrad/kokoro-82m", "kind": "kokoro"},
 )
+SPEECH_ATTEMPT_TIMEOUT_SECONDS = 8.0
 TRANSCRIBE_ATTEMPTS = (
-    {
-        "model": "openai/whisper-large-v3-turbo",
-        "only": ["deepinfra", "groq"],
-    },
-    {
-        "model": "openai/whisper-large-v3",
-        "only": ["deepinfra", "groq"],
-    },
-    {
-        "model": "qwen/qwen3-asr-flash-2026-02-10",
-        "only": ["alibaba"],
-    },
+    {"model": "openai/whisper-large-v3-turbo"},
+    {"model": "openai/whisper-large-v3"},
+    {"model": "qwen/qwen3-asr-flash-2026-02-10"},
 )
 
 # Reasoning off by default. The default model reports mandatory=false with
@@ -704,8 +680,9 @@ def _audio_format(filename: str, content_type: str) -> str:
 def _speech_model_candidates(requested: str) -> List[str]:
     raw = (requested or DEFAULT_KOKORO_MODEL).strip()
     ordered: List[str] = []
+    if raw.startswith("deepinfra/"):
+        raw = raw[len("deepinfra/") :]
     if raw and "/" not in raw:
-        ordered.append("deepinfra/hexgrad/{0}".format(raw))
         ordered.append("hexgrad/{0}".format(raw))
     if raw:
         ordered.append(raw)
@@ -766,9 +743,9 @@ def transcribe_audio(
 ) -> Dict[str, Any]:
     """Voice question in, text out.
 
-    Always JSON `input_audio` plus `provider.only` for DeepInfra/Groq. Multipart
-    without `only` was routing `openai/whisper-*` to OpenAI and 400ing
-    "No credentials for provider: openai" on workspaces that are not BYOK.
+    JSON `input_audio` only. Multipart against /audio/transcriptions 400s
+    "Invalid multipart form data". Do not send provider.only — the working
+    live payload is model + input_audio.data + input_audio.format.
     """
 
     profile = profile or LlmProfile()
@@ -779,9 +756,7 @@ def transcribe_audio(
     attempts = list(TRANSCRIBE_ATTEMPTS)
     requested = (profile.transcribe_model or "").strip()
     if requested and requested not in [entry["model"] for entry in attempts]:
-        attempts.insert(
-            0, {"model": requested, "only": ["deepinfra", "groq", "alibaba"]}
-        )
+        attempts.insert(0, {"model": requested})
 
     for entry in attempts:
         def attempt(api_key: str, chosen: Dict[str, Any] = entry):
@@ -797,7 +772,6 @@ def transcribe_audio(
                         "data": encoded_audio,
                         "format": audio_format,
                     },
-                    "provider": {"only": list(chosen["only"])},
                 },
                 timeout_seconds=90.0,
             )
@@ -823,23 +797,24 @@ def synthesize_speech_kokoro(
     voice_identifier: str = "af_heart",
     profile: Optional[LlmProfile] = None,
 ) -> Dict[str, Any]:
-    """Speak one block. Tries Kokoro on DeepInfra, then OpenRouter speech adapters.
+    """Speak one block on OpenRouter credits.
 
-    `/audio/speech` is not the model catalogue. It rejected `hexgrad/kokoro-82m`
-    with "Use format: provider/model" because hexgrad is the HuggingFace org.
-    DeepInfra is the billed provider, so the first attempt is
-    `deepinfra/hexgrad/kokoro-82m`. If that slug is also rejected, fall through
-    to Mistral Voxtral and Grok Voice — both are actual speech-endpoint adapters
-    that run on OpenRouter credits.
+    Catalogue slug only — no provider.only, no deepinfra/ prefix. Those were
+    the 400s. Grok Voice is first because Kokoro currently hangs.
     """
     profile = profile or LlmProfile()
     last_error: Optional[ProviderHttpError] = None
     attempts = list(SPEECH_ATTEMPTS)
     requested = (profile.speech_model or "").strip()
+    if requested.startswith("deepinfra/"):
+        requested = requested[len("deepinfra/") :]
     if requested and requested not in [entry["model"] for entry in attempts]:
-        attempts.insert(
-            0, {"model": requested, "only": ["deepinfra"], "kind": "kokoro"}
-        )
+        kind = "kokoro"
+        if "voxtral" in requested:
+            kind = "voxtral"
+        elif "grok" in requested:
+            kind = "grok"
+        attempts.insert(0, {"model": requested, "kind": kind})
 
     for entry in attempts:
         def attempt(api_key: str, chosen: Dict[str, Any] = entry):
@@ -856,8 +831,8 @@ def synthesize_speech_kokoro(
                         chosen["kind"], voice_identifier
                     ),
                     "response_format": "mp3",
-                    "provider": {"only": list(chosen["only"])},
                 },
+                timeout_seconds=SPEECH_ATTEMPT_TIMEOUT_SECONDS,
             )
             result = {
                 "audio_bytes": audio_bytes,
@@ -872,7 +847,10 @@ def synthesize_speech_kokoro(
             return run_with_rotation(vault.pool("openrouter"), attempt)
         except ProviderHttpError as http_error:
             last_error = http_error
-            if http_error.status_code == 400:
+            # Kokoro is in the catalogue but the speech adapter sometimes
+            # accepts the request and never replies. Bound that and try the
+            # next adapter; 400 is a rejected slug/voice, not a dead key.
+            if http_error.status_code in (400, 502, 503, 504):
                 continue
             raise
 

@@ -58,16 +58,29 @@ class PlanPatchTests(unittest.TestCase):
 
 
 class SpeechModelSlugTests(unittest.TestCase):
-    def test_bare_kokoro_id_gets_a_provider_prefix(self):
+    def test_bare_kokoro_id_gets_the_catalogue_org(self):
         candidates = _speech_model_candidates("kokoro-82m")
-        self.assertEqual(candidates[0], "deepinfra/hexgrad/kokoro-82m")
-        self.assertIn("hexgrad/kokoro-82m", candidates)
+        self.assertEqual(candidates[0], "hexgrad/kokoro-82m")
 
-    def test_catalog_slug_is_kept_and_deepinfra_is_offered(self):
+    def test_catalog_slug_is_kept_and_hosting_prefixes_are_stripped(self):
         candidates = _speech_model_candidates("hexgrad/kokoro-82m")
         self.assertEqual(candidates[0], "hexgrad/kokoro-82m")
-        self.assertIn("deepinfra/hexgrad/kokoro-82m", candidates)
+        self.assertFalse(any(item.startswith("deepinfra/") for item in candidates))
         self.assertFalse(any(item.startswith("together/") for item in candidates))
+
+    def test_stale_deepinfra_prefix_is_stripped(self):
+        candidates = _speech_model_candidates("deepinfra/hexgrad/kokoro-82m")
+        self.assertEqual(candidates[0], "hexgrad/kokoro-82m")
+
+    def test_speech_attempts_are_plain_catalogue_slugs(self):
+        from praxis.llm import SPEECH_ATTEMPTS
+
+        models = [entry["model"] for entry in SPEECH_ATTEMPTS]
+        self.assertEqual(models[0], "x-ai/grok-voice-tts-1.0")
+        self.assertIn("hexgrad/kokoro-82m", models)
+        for entry in SPEECH_ATTEMPTS:
+            self.assertNotIn("only", entry)
+            self.assertEqual(entry["model"].count("/"), 1)
 
 
 class AudioFormatTests(unittest.TestCase):
