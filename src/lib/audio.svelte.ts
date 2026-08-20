@@ -47,6 +47,8 @@ export const playback = $state<PlaybackState>({
 });
 
 const audioCache = new Map<string, CachedAudio>();
+/** In-flight synthesis, keyed by block id, so prefetch and play share one request. */
+const inflightByBlock = new Map<string, Promise<CachedAudio>>();
 let audioElement: HTMLAudioElement | null = null;
 /** Incremented on every stop so a late synthesis cannot resurrect old playback. */
 let playbackGeneration = 0;
@@ -57,63 +59,88 @@ function currentVoice(): string {
 		: settings.kokoroVoice;
 }
 
+function cacheHits(block: Block, cached: CachedAudio | undefined, voice: string, emotion: string) {
+	return Boolean(
+		cached &&
+			cached.sourceText === block.text &&
+			cached.sourceVoice === voice &&
+			cached.sourceEmotion === emotion
+	);
+}
+
 async function synthesizeBlock(block: Block): Promise<CachedAudio> {
 	const voiceNow = currentVoice();
 	const emotionNow = settings.speechProvider === 'speechify' ? settings.speechifyEmotion : '';
 	const cached = audioCache.get(block.id);
-	if (
-		cached &&
-		cached.sourceText === block.text &&
-		cached.sourceVoice === voiceNow &&
-		cached.sourceEmotion === emotionNow
-	) {
+	if (cacheHits(block, cached, voiceNow, emotionNow) && cached) {
 		return cached;
 	}
-	if (cached) URL.revokeObjectURL(cached.objectUrl);
 
-	const response = await fetch(backendUrl('/api/speak'), {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({
-			text: block.text,
-			provider: settings.speechProvider,
-			voice: voiceNow,
-			speechify_model: settings.speechifyModel,
-			emotion: settings.speechifyEmotion,
-			secrets: secretsPayload(),
-			llm: llmPayload()
-		})
-	});
+	const pending = inflightByBlock.get(block.id);
+	if (pending) return pending;
 
-	if (!response.ok) {
-		let detail = `HTTP ${response.status}`;
-		try {
-			detail = (await response.json()).detail || detail;
-		} catch {
-			/* keep the status line */
+	const work = (async () => {
+		const stale = audioCache.get(block.id);
+		if (stale) URL.revokeObjectURL(stale.objectUrl);
+
+		const response = await fetch(backendUrl('/api/speak'), {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({
+				text: block.text,
+				provider: settings.speechProvider,
+				voice: voiceNow,
+				speechify_model: settings.speechifyModel,
+				emotion: settings.speechifyEmotion,
+				secrets: secretsPayload(),
+				llm: llmPayload()
+			})
+		});
+
+		if (!response.ok) {
+			let detail = `HTTP ${response.status}`;
+			try {
+				detail = (await response.json()).detail || detail;
+			} catch {
+				/* keep the status line */
+			}
+			throw new Error(detail);
 		}
-		throw new Error(detail);
+
+		const payload = await response.json();
+		absorbUsage(payload.usage);
+
+		const audioBytes = Uint8Array.from(atob(payload.audio_base64), (character) =>
+			character.charCodeAt(0)
+		);
+		const objectUrl = URL.createObjectURL(
+			new Blob([audioBytes], { type: payload.content_type || 'audio/mpeg' })
+		);
+
+		const entry: CachedAudio = {
+			objectUrl,
+			sourceText: block.text,
+			sourceVoice: voiceNow,
+			sourceEmotion: emotionNow,
+			speechMarks: payload.speech_marks ?? null
+		};
+		audioCache.set(block.id, entry);
+		return entry;
+	})();
+
+	inflightByBlock.set(block.id, work);
+	try {
+		return await work;
+	} finally {
+		if (inflightByBlock.get(block.id) === work) inflightByBlock.delete(block.id);
 	}
+}
 
-	const payload = await response.json();
-	absorbUsage(payload.usage);
-
-	const audioBytes = Uint8Array.from(atob(payload.audio_base64), (character) =>
-		character.charCodeAt(0)
-	);
-	const objectUrl = URL.createObjectURL(
-		new Blob([audioBytes], { type: payload.content_type || 'audio/mpeg' })
-	);
-
-	const entry: CachedAudio = {
-		objectUrl,
-		sourceText: block.text,
-		sourceVoice: voiceNow,
-		sourceEmotion: emotionNow,
-		speechMarks: payload.speech_marks ?? null
-	};
-	audioCache.set(block.id, entry);
-	return entry;
+function prefetchBlock(block: Block | undefined): void {
+	if (!block) return;
+	synthesizeBlock(block).catch(() => {
+		/* Play will retry this block and surface the error if it still fails. */
+	});
 }
 
 function playableBlocksFrom(startIndex: number): Block[] {
@@ -147,9 +174,9 @@ export function stopPlayback(): void {
 /**
  * Play from a block to the end of the lesson, or just that one block.
  *
- * Synthesis happens one block ahead of playback rather than all at once, so the
- * first block starts sounding immediately instead of after the whole episode has
- * been generated.
+ * The first block is synthesised before anything plays. While it is sounding,
+ * the next block's clip is already being generated, so the join is a cache hit
+ * instead of a pause on the speech API.
  */
 export async function playFrom(blockId: string, singleBlockOnly = false): Promise<void> {
 	stopPlayback();
@@ -169,7 +196,9 @@ export async function playFrom(blockId: string, singleBlockOnly = false): Promis
 	if (!audioElement) audioElement = new Audio();
 
 	try {
-		for (const block of queue) {
+		for (let index = 0; index < queue.length; index += 1) {
+			const block = queue[index];
+			if (!block) break;
 			if (playbackGeneration !== thisGeneration) return;
 
 			playback.activeBlockId = block.id;
@@ -181,6 +210,7 @@ export async function playFrom(blockId: string, singleBlockOnly = false): Promis
 
 			audioElement.src = audio.objectUrl;
 			await audioElement.play();
+			if (!singleBlockOnly) prefetchBlock(queue[index + 1]);
 			const outcome = await waitForEnd(audioElement);
 			if (outcome === 'stopped' || playbackGeneration !== thisGeneration) return;
 		}
